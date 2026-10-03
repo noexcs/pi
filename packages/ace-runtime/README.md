@@ -4,7 +4,8 @@ ACE (Agent Context Event Protocol) 0.1 runtime on top of [Pi](../../packages/cod
 events — CI results, alerts, other agents — an *active* input to a running agent instead of something the agent
 has to poll for.
 
-Protocol semantics come from `ACE-RFC-Draft-0.1.md`; engineering decisions from `ace-v0.1.md`.
+Protocol semantics come from the `ACE-RFC-Draft-0.1.md` draft and engineering decisions from `ace-v0.1.md`.
+Those two documents live in the workspace that hosts this implementation; they are not part of this fork.
 
 ```text
 External World
