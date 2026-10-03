@@ -1,22 +1,16 @@
 /**
- * ACE 0.1 extension for Pi: inject external events into the session you are chatting in.
+ * ACE 0.1 extension for Pi: receive external events into the session you are chatting in, and
+ * publish events to peers.
  *
  * Configuration is read from `.ace.json` in the session working directory (RFC §10 runtime
  * configuration), or from `ACE_CONFIG` when that points somewhere else:
  *
  * ```json
  * {
+ *   "sender": "agent-a",
  *   "defaultActivation": "next_turn",
- *   "inputs": [
- *     {
- *       "name": "build-events",
- *       "transport": "redis-streams",
- *       "stream": "ace:events",
- *       "group": "ace-pi",
- *       "url": "redis://127.0.0.1:6379",
- *       "activation": "next_turn"
- *     }
- *   ]
+ *   "inputs":  [ { "name": "from-b", "transport": "redis-streams", "stream": "ace:to-a", "group": "ace-pi" } ],
+ *   "outputs": [ { "name": "to-b",   "transport": "redis-streams", "stream": "ace:to-b" } ]
  * }
  * ```
  *
@@ -26,31 +20,35 @@
  * pi --extension /path/to/ace-runtime/extensions/ace.ts
  * ```
  *
- * and publish from anywhere:
+ * Receiving: while a turn runs, `next_turn` events are queued after it (`followUp`) and `immediate`
+ * events at its next boundary (`steer`); while Pi is idle the event starts a turn. `manual` events are
+ * retained in memory — inspect and activate them with `/ace`, `/ace pending`, `/ace activate <sender> <id>`.
  *
- * ```bash
- * redis-cli XADD ace:events '*' message \
- *   '{"aceVersion":"0.1","id":"e1","sender":"ci","activation":"next_turn","body":"Build failed."}'
- * ```
+ * Publishing: the `ace_publish` tool appends an ACE message to a configured output, which is how two
+ * Pi agents talk to each other (agent A consumes `ace:to-a` and publishes to `ace:to-b`; agent B the
+ * other way round). The address lives in configuration, never in the message (RFC §4.1).
  *
- * While a turn runs, `next_turn` events are queued after it (`followUp`) and `immediate` events at its
- * next boundary (`steer`); while Pi is idle the event starts a turn. `manual` events are retained in
- * memory — inspect and activate them with `/ace`, `/ace pending`, `/ace activate <sender> <id>`.
- *
- * Without a config file, a single input is taken from `ACE_STREAM` (plus `ACE_GROUP`, `ACE_REDIS_URL`,
- * `ACE_CONSUMER`, `ACE_FIELD`); `ACE_LOG=1` also logs runtime lines in modes without a UI.
+ * `ACE_CONFIG` points at a different configuration file; every MQ setting stays in that file.
+ * `ACE_LOG=1` also logs runtime lines in modes without a UI.
  */
 
+import { randomUUID } from "node:crypto";
+import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
 	ACE_CONFIG_FILENAME,
 	type AceLogger,
+	type AcePublisher,
 	AceRuntime,
+	createPublishers,
 	createTransports,
 	type InputConfig,
+	type OutputConfig,
 	PiExtensionAdapter,
-	type ResolvedAceInputs,
-	resolveAceInputs,
+	type ResolvedAceConfig,
+	resolveAceConfig,
+	validateAceMessage,
 } from "../src/index.ts";
 
 function describeError(error: unknown): string {
@@ -86,15 +84,40 @@ function truncate(text: string, limit = 60): string {
 	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
-function describeInput(input: InputConfig): string {
-	const address = input.stream ?? input.subject ?? input.topic ?? "(no address)";
-	return `${input.name} (${input.transport} ${String(address)})`;
+function describeTarget(config: InputConfig | OutputConfig): string {
+	const address = config.stream ?? config.subject ?? config.topic ?? "(no address)";
+	return `${config.name} (${config.transport} ${String(address)})`;
+}
+
+/**
+ * Resolve which configured output a publish call targets.
+ *
+ * `target` names an entry of `outputs`; it is optional when exactly one output is configured.
+ */
+function selectPublisher(
+	publishers: Readonly<Record<string, AcePublisher>>,
+	target: string | undefined,
+): { name: string; publisher: AcePublisher } {
+	const names = Object.keys(publishers);
+	if (names.length === 0) {
+		throw new Error(`no outputs configured; add an "outputs" entry to ${ACE_CONFIG_FILENAME}`);
+	}
+	if (target === undefined) {
+		if (names.length > 1) throw new Error(`several outputs configured (${names.join(", ")}); pass target`);
+		const name = names[0] as string;
+		return { name, publisher: publishers[name] as AcePublisher };
+	}
+	const publisher = publishers[target];
+	if (!publisher) throw new Error(`unknown output "${target}" (configured: ${names.join(", ")})`);
+	return { name: target, publisher };
 }
 
 export default function aceExtension(pi: ExtensionAPI): void {
 	let sessionContext: ExtensionContext | undefined;
 	let runtime: AceRuntime | undefined;
-	let origin: string | undefined;
+	let publishers: Record<string, AcePublisher> = {};
+	let resolvedConfig: ResolvedAceConfig | undefined;
+	let transportErrorReported = false;
 
 	const adapter = new PiExtensionAdapter({ pi, isIdle: () => sessionContext?.isIdle() ?? true });
 
@@ -102,20 +125,28 @@ export default function aceExtension(pi: ExtensionAPI): void {
 		sessionContext = ctx;
 		if (runtime) return;
 
-		let resolved: ResolvedAceInputs;
+		let resolved: ResolvedAceConfig;
 		try {
-			resolved = resolveAceInputs({ cwd: ctx.cwd });
+			resolved = resolveAceConfig({ cwd: ctx.cwd });
 		} catch (error) {
 			report(ctx, `[ace] not started: ${describeError(error)}`, "warning");
 			return;
 		}
 
 		const logger = createLogger(ctx);
+		publishers = createPublishers(resolved.outputs, {
+			onError: (error) => report(ctx, `[ace] publish transport error: ${describeError(error)}`, "error"),
+		});
 		runtime = new AceRuntime({
 			engine: adapter,
 			inputs: resolved.inputs,
 			transports: createTransports(resolved.inputs, {
-				onError: (error) => report(ctx, `[ace] transport error: ${describeError(error)}`, "error"),
+				onError: (error) => {
+					// A broker that dies mid-session would otherwise repeat the same error.
+					if (transportErrorReported) return;
+					transportErrorReported = true;
+					report(ctx, `[ace] transport error: ${describeError(error)}`, "error");
+				},
 			}),
 			...(resolved.defaultActivation ? { defaultActivation: resolved.defaultActivation } : {}),
 			logger,
@@ -123,11 +154,16 @@ export default function aceExtension(pi: ExtensionAPI): void {
 
 		try {
 			await runtime.start();
-			origin = resolved.source;
-			report(ctx, `[ace] listening (${resolved.source}): ${resolved.inputs.map(describeInput).join(", ")}`);
+			resolvedConfig = resolved;
+			const outputs =
+				resolved.outputs.length > 0 ? `; publishing to ${resolved.outputs.map(describeTarget).join(", ")}` : "";
+			report(
+				ctx,
+				`[ace] listening (${resolved.source}): ${resolved.inputs.map(describeTarget).join(", ")}${outputs}`,
+			);
 		} catch (error) {
 			runtime = undefined;
-			origin = undefined;
+			resolvedConfig = undefined;
 			report(
 				ctx,
 				`[ace] could not start: ${describeError(error)} (check the broker in .ace.json, then restart Pi)`,
@@ -138,10 +174,68 @@ export default function aceExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		const active = runtime;
+		const activePublishers = Object.values(publishers);
 		runtime = undefined;
-		origin = undefined;
+		publishers = {};
+		resolvedConfig = undefined;
 		sessionContext = undefined;
 		await active?.stop();
+		for (const publisher of activePublishers) await publisher.close();
+	});
+
+	pi.registerTool({
+		name: "ace_publish",
+		label: "ACE Publish",
+		description:
+			"Publish an ACE 0.1 event to a configured peer agent or service (the `outputs` of .ace.json). " +
+			"The recipient's agent receives the body as an external event and acts on it on its own. " +
+			"The body is opaque to ACE: write plain text the peer's agent should understand.",
+		promptGuidelines: [
+			"Use ace_publish to notify another agent or service; keep the body self-contained.",
+			"Events you publish are visible to every agent consuming the target stream, including yourself if you consume it.",
+		],
+		parameters: Type.Object({
+			body: Type.String({ description: "Event body; the peer's agent reads this" }),
+			activation: Type.Optional(
+				StringEnum(["default", "next_turn", "immediate", "manual"] as const, {
+					description: "How urgently the peer should process it; omit unless you know the peer's setup",
+				}),
+			),
+			target: Type.Optional(
+				Type.String({ description: "Configured output name; required only when several exist" }),
+			),
+			id: Type.Optional(Type.String({ description: "Message id for correlation; generated when omitted" })),
+		}),
+
+		async execute(_toolCallId, params) {
+			const { name, publisher } = selectPublisher(publishers, params.target);
+			const sender = resolvedConfig?.sender ?? `pi-${process.pid}`;
+			const message = validateAceMessage({
+				aceVersion: "0.1",
+				id: params.id ?? `evt_${randomUUID()}`,
+				sender,
+				activation: params.activation ?? "default",
+				body: params.body,
+			});
+
+			await publisher.publish(message);
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Published ${message.id} from ${sender} to output "${name}" (activation: ${message.activation}).`,
+					},
+				],
+				details: {
+					id: message.id,
+					sender: message.sender,
+					activation: message.activation,
+					target: name,
+					bodyLength: message.body.length,
+				},
+			};
+		},
 	});
 
 	pi.registerCommand("ace", {
@@ -189,7 +283,12 @@ export default function aceExtension(pi: ExtensionAPI): void {
 			}
 
 			const state = adapter.isRunning() ? "running" : "idle";
-			report(ctx, `[ace] ${origin ?? "started"}, agent ${state}, ${pending.length} pending manual event(s)`);
+			const outputs = Object.keys(publishers);
+			report(
+				ctx,
+				`[ace] ${resolvedConfig?.source ?? "started"} as ${resolvedConfig?.sender ?? "?"}, agent ${state}, ` +
+					`${pending.length} pending manual event(s), ${outputs.length > 0 ? `outputs: ${outputs.join(", ")}` : "no outputs"}`,
+			);
 		},
 	});
 }

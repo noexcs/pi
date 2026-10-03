@@ -1,5 +1,10 @@
-import { AceConfigError, type InputConfig } from "../runtime/input-config.ts";
-import { describeValue } from "../utils.ts";
+import {
+	AceConfigError,
+	type InputConfig,
+	optionalStringField,
+	positiveIntegerField,
+	requiredStringField,
+} from "../runtime/input-config.ts";
 import type { RedisStreamEntry, RedisStreamsClient } from "./redis-streams-client.ts";
 import { createRedisStreamsClient } from "./redis-streams-node-client.ts";
 import type { RawAceMessageHandler, Transport } from "./transport.ts";
@@ -25,48 +30,26 @@ export interface RedisStreamsConfig {
 }
 
 const DEFAULT_CONSUMER = `ace-${process.pid}`;
-const DEFAULTS = { url: "redis://127.0.0.1:6379", field: "message", count: 16, blockMs: 1000 };
 
-function requiredString(input: InputConfig, key: string): string {
-	const value = input[key];
-	if (typeof value !== "string" || value.length === 0) {
-		throw new AceConfigError(
-			`input "${input.name}" needs a non-empty "${key}" for the Redis Streams transport, received ${describeValue(value)}`,
-		);
-	}
-	return value;
-}
-
-function optionalString(input: InputConfig, key: string, fallback: string): string {
-	const value = input[key];
-	if (value === undefined) return fallback;
-	if (typeof value !== "string" || value.length === 0) {
-		throw new AceConfigError(`input "${input.name}" has invalid "${key}": ${describeValue(value)}`);
-	}
-	return value;
-}
-
-function positiveInteger(input: InputConfig, key: string, fallback: number): number {
-	const value = input[key];
-	if (value === undefined) return fallback;
-	if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-		throw new AceConfigError(
-			`input "${input.name}" has invalid "${key}": ${describeValue(value)} (needs an integer >= 1)`,
-		);
-	}
-	return value;
-}
+/** Defaults shared by the Redis Streams consumer and publisher. */
+export const REDIS_STREAMS_DEFAULTS = {
+	url: "redis://127.0.0.1:6379",
+	field: "message",
+	count: 16,
+	blockMs: 1000,
+} as const;
 
 /** Extract and validate the Redis Streams settings of one input config. */
 export function redisStreamsConfigFrom(input: InputConfig): RedisStreamsConfig {
+	const subject = `input "${input.name}"`;
 	return {
-		url: optionalString(input, "url", DEFAULTS.url),
-		stream: requiredString(input, "stream"),
-		group: requiredString(input, "group"),
-		consumer: optionalString(input, "consumer", DEFAULT_CONSUMER),
-		field: optionalString(input, "field", DEFAULTS.field),
-		count: positiveInteger(input, "count", DEFAULTS.count),
-		blockMs: positiveInteger(input, "blockMs", DEFAULTS.blockMs),
+		url: optionalStringField(input, "url", REDIS_STREAMS_DEFAULTS.url, subject),
+		stream: requiredStringField(input, "stream", subject),
+		group: requiredStringField(input, "group", subject),
+		consumer: optionalStringField(input, "consumer", DEFAULT_CONSUMER, subject),
+		field: optionalStringField(input, "field", REDIS_STREAMS_DEFAULTS.field, subject),
+		count: positiveIntegerField(input, "count", REDIS_STREAMS_DEFAULTS.count, subject),
+		blockMs: positiveIntegerField(input, "blockMs", REDIS_STREAMS_DEFAULTS.blockMs, subject),
 	};
 }
 

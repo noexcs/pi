@@ -22,5 +22,6 @@ export * from "./runtime/pending-event-store.ts";
 export * from "./transport/in-memory-transport.ts";
 export * from "./transport/redis-streams-client.ts";
 export * from "./transport/redis-streams-node-client.ts";
+export * from "./transport/redis-streams-publisher.ts";
 export * from "./transport/redis-streams-transport.ts";
 export * from "./transport/transport.ts";

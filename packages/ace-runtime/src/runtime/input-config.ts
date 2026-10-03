@@ -24,6 +24,52 @@ export class AceConfigError extends Error {
 	}
 }
 
+/** Anything with a name that carries transport settings: an input or an output. */
+export interface NamedTransportConfig {
+	name: string;
+	transport: string;
+	[key: string]: unknown;
+}
+
+/** Read a required non-empty string setting; `subject` names the owner in the error. */
+export function requiredStringField(config: NamedTransportConfig, key: string, subject: string): string {
+	const value = config[key];
+	if (typeof value !== "string" || value.length === 0) {
+		throw new AceConfigError(`${subject} needs a non-empty "${key}", received ${describeValue(value)}`);
+	}
+	return value;
+}
+
+/** Read an optional non-empty string setting, falling back to a default. */
+export function optionalStringField(
+	config: NamedTransportConfig,
+	key: string,
+	fallback: string,
+	subject: string,
+): string {
+	const value = config[key];
+	if (value === undefined) return fallback;
+	if (typeof value !== "string" || value.length === 0) {
+		throw new AceConfigError(`${subject} has invalid "${key}": ${describeValue(value)}`);
+	}
+	return value;
+}
+
+/** Read an optional positive integer setting, falling back to a default. */
+export function positiveIntegerField(
+	config: NamedTransportConfig,
+	key: string,
+	fallback: number,
+	subject: string,
+): number {
+	const value = config[key];
+	if (value === undefined) return fallback;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+		throw new AceConfigError(`${subject} has invalid "${key}": ${describeValue(value)} (needs an integer >= 1)`);
+	}
+	return value;
+}
+
 /** Validate a single input configuration entry (RFC §9). */
 export function validateInputConfig(value: unknown): InputConfig {
 	if (!isPlainObject(value)) {

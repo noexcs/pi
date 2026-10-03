@@ -79,9 +79,10 @@ The extension in [`extensions/ace.ts`](extensions/ace.ts) runs **inside** Pi and
 session you are chatting in — no separate runtime process, no second session.
 
 ```bash
-# 1. describe where events come from (session working directory)
+# 1. every MQ setting lives in .ace.json (code holds the mechanisms, not the addresses)
 cat > .ace.json <<'JSON'
 {
+  "sender": "agent-a",
   "defaultActivation": "next_turn",
   "inputs": [
     {
@@ -112,14 +113,17 @@ Load it permanently by copying or symlinking the file into `~/.pi/agent/extensio
 
 | Field | Meaning |
 |---|---|
+| `sender` | Sender identifier this session publishes under (RFC §5.3); required once `outputs` exist, otherwise defaults to `pi-<pid>` |
 | `defaultActivation` | `immediate` \| `next_turn` \| `manual`; the RFC §8 fallback when neither input nor message decides |
-| `inputs[].name` | Input name; also the key its transport is registered under |
-| `inputs[].transport` | Transport kind; `redis-streams` is the only one implemented (RFC §4.1 names the others) |
+| `inputs[]` | Where events come from; `name` is the key its transport is registered under |
+| `outputs[]` | Where the `ace_publish` tool sends events; `name` is the target it is addressed by |
+| `*.transport` | Transport kind; `redis-streams` is the only one implemented (RFC §4.1 names the others) |
 | `inputs[].activation` | Receiver override for this input (RFC §8); `default` delegates to the message |
-| remaining keys | Transport settings: `stream`, `group`, `url`, `consumer`, `field`, `count`, `blockMs` |
+| remaining keys | Transport settings: `stream`, `group`, `url`, `consumer`, `field`, `count`, `blockMs` (publisher: everything but `group`, `consumer`, `count`, `blockMs`) |
 
-Without `.ace.json` the extension falls back to `ACE_STREAM` (+ `ACE_GROUP`, `ACE_REDIS_URL`, `ACE_CONSUMER`,
-`ACE_FIELD`); `ACE_LOG=1` also logs runtime lines in modes without a UI.
+`.ace.json` is the only source of MQ configuration — there is no environment fallback for addresses, streams, or
+groups. `ACE_CONFIG` selects a different config file path, `ACE_LOG=1` also logs runtime lines in modes without a
+UI.
 
 ### What injection looks like
 
@@ -132,6 +136,26 @@ Without `.ace.json` the extension falls back to `ACE_STREAM` (+ `ACE_GROUP`, `AC
 Pi resolves idle-vs-streaming itself for `sendUserMessage`, so the extension passes the delivery mode and lets Pi
 queue the event; the last action also shows on the status line (`ace: injecting id=… sender=… agent=running`).
 
+### Talking to another agent
+
+`outputs` plus the `ace_publish` tool make two Pi sessions exchange ACE events (RFC §19, Agent → Agent). Each
+side consumes what the other publishes, so neither sees its own messages:
+
+```text
+agent A                                    agent B
+  .ace.json                                  .ace.json
+  inputs:  from-b  = ace:to-a                 inputs:  from-a  = ace:to-b
+  outputs: to-b    = ace:to-b                 outputs: to-a    = ace:to-a
+  sender:  agent-a                            sender:  agent-b
+       │  ace_publish ──► ace:to-b ──────────────►  injected into B's conversation
+       │  ◄────────────── ace:to-a ◄──── ace_publish (B replies)
+```
+
+`ace_publish` takes `body` (the event text the peer's agent reads), optional `activation`
+(`default` \| `next_turn` \| `immediate` \| `manual`), optional `target` (an output name, needed only when several
+are configured — the address itself never travels in the message, RFC §4.1), and an optional `id` for correlation.
+The tool result reports the published id, sender, and target.
+
 ### `/ace` commands
 
 | Command | Effect |
@@ -139,6 +163,8 @@ queue the event; the last action also shows on the status line (`ace: injecting 
 | `/ace` | origin of the configuration, agent state, number of retained `manual` events |
 | `/ace pending` | list retained `manual` events (`sender/id: body`) |
 | `/ace activate <sender> <id>` | inject a retained event as `next_turn` |
+
+The status line shows the runtime's last action (`ace: injecting id=… sender=… agent=running`).
 
 ## Transports
 

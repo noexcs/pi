@@ -2,12 +2,29 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ConcreteActivation } from "../protocol/ace-message.ts";
 import { isConcreteActivation } from "../protocol/ace-message.ts";
-import { RedisStreamsTransport, redisStreamsConfigFrom } from "../transport/redis-streams-transport.ts";
+import type { AcePublisher } from "../transport/redis-streams-publisher.ts";
+import { RedisStreamsPublisher } from "../transport/redis-streams-publisher.ts";
+import {
+	REDIS_STREAMS_DEFAULTS,
+	RedisStreamsTransport,
+	redisStreamsConfigFrom,
+} from "../transport/redis-streams-transport.ts";
 import type { Transport } from "../transport/transport.ts";
 import { describeValue, isPlainObject } from "../utils.ts";
-import { AceConfigError, type InputConfig, validateInputConfig } from "./input-config.ts";
+import {
+	AceConfigError,
+	type InputConfig,
+	optionalStringField,
+	requiredStringField,
+	validateInputConfig,
+} from "./input-config.ts";
 
-/** Name of the runtime configuration file read from the session working directory. */
+/**
+ * Name of the runtime configuration file read from the session working directory.
+ *
+ * Every MQ setting (addresses, streams, groups, targets, identity) lives here; the code holds only
+ * the generic mechanisms and the defaults a transport falls back to.
+ */
 export const ACE_CONFIG_FILENAME = ".ace.json";
 
 /** Transport kinds this runtime can build from configuration (RFC §4.1 lists the others). */
@@ -22,7 +39,18 @@ export const SUPPORTED_TRANSPORTS: readonly string[] = ["redis-streams"];
 export interface AceConfigFile {
 	/** Fallback activation for inputs and messages that delegate with `default` (RFC §8). */
 	defaultActivation?: ConcreteActivation;
+	/** Sender identifier this session publishes under (RFC §5.3); required once `outputs` exist. */
+	sender?: string;
 	inputs: InputConfig[];
+	/** Publishing targets (RFC §19); the address stays here, never in the message (§4.1). */
+	outputs?: OutputConfig[];
+}
+
+/** A publishing target: the keys of an input (`name`, `transport`, address, …) minus consumer-only ones. */
+export interface OutputConfig {
+	name: string;
+	transport: string;
+	[key: string]: unknown;
 }
 
 export interface LoadedAceConfig {
@@ -31,13 +59,23 @@ export interface LoadedAceConfig {
 	config: AceConfigFile;
 }
 
+/** Inputs, publishing targets, identity, the activation default, and where they came from. */
+export interface ResolvedAceConfig {
+	inputs: InputConfig[];
+	outputs: OutputConfig[];
+	defaultActivation?: ConcreteActivation;
+	/** `pi-<pid>` when the configuration does not name one. */
+	sender: string;
+	source: string;
+}
+
 /** Validate a parsed `.ace.json` document. */
 export function parseAceConfig(value: unknown, source: string): AceConfigFile {
 	if (!isPlainObject(value)) {
 		throw new AceConfigError(`${source} must contain a JSON object, received ${describeValue(value)}`);
 	}
 
-	const { defaultActivation, inputs } = value;
+	const { defaultActivation, inputs, sender } = value;
 	if (defaultActivation !== undefined && !isConcreteActivation(defaultActivation)) {
 		throw new AceConfigError(
 			`${source}: defaultActivation must be immediate|next_turn|manual, received ${describeValue(defaultActivation)}`,
@@ -46,10 +84,72 @@ export function parseAceConfig(value: unknown, source: string): AceConfigFile {
 	if (!Array.isArray(inputs) || inputs.length === 0) {
 		throw new AceConfigError(`${source}: inputs must be a non-empty array`);
 	}
+	if (sender !== undefined && (typeof sender !== "string" || sender.length === 0)) {
+		throw new AceConfigError(`${source}: sender must be a non-empty string, received ${describeValue(sender)}`);
+	}
 
-	const parsed = inputs.map(validateInputConfig);
-	for (const input of parsed) validateTransportSettings(input);
-	return { defaultActivation, inputs: parsed };
+	const parsedInputs = inputs.map(validateInputConfig);
+	for (const input of parsedInputs) validateTransportSettings(input);
+
+	const parsedOutputs = parseOutputs(value.outputs, source);
+	if (parsedOutputs && sender === undefined) {
+		throw new AceConfigError(`${source}: sender is required when outputs are configured (peers identify you by it)`);
+	}
+
+	return {
+		defaultActivation,
+		...(sender === undefined ? {} : { sender }),
+		inputs: parsedInputs,
+		...(parsedOutputs ? { outputs: parsedOutputs } : {}),
+	};
+}
+
+function parseOutputs(value: unknown, source: string): OutputConfig[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length === 0) {
+		throw new AceConfigError(`${source}: outputs must be a non-empty array when present`);
+	}
+
+	const outputs = value.map((entry) => validateOutputConfig(entry));
+	const names = new Set<string>();
+	for (const output of outputs) {
+		if (names.has(output.name))
+			throw new AceConfigError(`${source}: output name "${output.name}" is configured twice`);
+		names.add(output.name);
+		validateOutputSettings(output);
+	}
+	return outputs;
+}
+
+/** Validate one publishing target: same structure as an input, without consumer settings. */
+export function validateOutputConfig(value: unknown): OutputConfig {
+	if (!isPlainObject(value)) {
+		throw new AceConfigError(`output config must be an object, received ${describeValue(value)}`);
+	}
+
+	const { name, transport } = value;
+	if (typeof name !== "string" || name.length === 0) {
+		throw new AceConfigError("output config requires a non-empty name");
+	}
+	if (typeof transport !== "string" || transport.length === 0) {
+		throw new AceConfigError(`output "${name}" requires a non-empty transport`);
+	}
+	return { ...value, name, transport };
+}
+
+function validateOutputSettings(output: OutputConfig): void {
+	const subject = `output "${output.name}"`;
+	switch (output.transport) {
+		case "redis-streams":
+			requiredStringField(output, "stream", subject);
+			optionalStringField(output, "url", REDIS_STREAMS_DEFAULTS.url, subject);
+			optionalStringField(output, "field", REDIS_STREAMS_DEFAULTS.field, subject);
+			return;
+		default:
+			throw new AceConfigError(
+				`output "${output.name}" uses unsupported transport ${describeValue(output.transport)} (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+			);
+	}
 }
 
 /** Reject unknown transport kinds and invalid transport settings while reading the file. */
@@ -68,7 +168,7 @@ function validateTransportSettings(input: InputConfig): void {
 /**
  * Load `.ace.json` from `ACE_CONFIG` or `<cwd>/.ace.json`.
  *
- * Returns `undefined` when neither exists, so a caller can fall back to another source.
+ * Returns `undefined` when neither exists; {@link resolveAceConfig} turns that into an error.
  */
 export function loadAceConfig(options: {
 	cwd: string;
@@ -90,62 +190,29 @@ export function loadAceConfig(options: {
 }
 
 /**
- * Build one input from environment variables, for runs without `.ace.json`.
+ * Resolve everything a host needs to run ACE in a session.
  *
- * Returns `undefined` when `ACE_STREAM` is unset.
+ * MQ configuration comes from `.ace.json` only — `ACE_CONFIG` selects a different file path, but
+ * there is no environment-variable fallback for addresses, streams, or groups.
  */
-export function inputFromEnvironment(
-	env: Readonly<Record<string, string | undefined>> = process.env,
-): InputConfig | undefined {
-	if (!env.ACE_STREAM) return undefined;
-	return {
-		name: env.ACE_INPUT ?? "ace-events",
-		transport: "redis-streams",
-		stream: env.ACE_STREAM,
-		group: env.ACE_GROUP ?? `ace-pi-${process.pid}`,
-		...(env.ACE_REDIS_URL ? { url: env.ACE_REDIS_URL } : {}),
-		...(env.ACE_CONSUMER ? { consumer: env.ACE_CONSUMER } : {}),
-		...(env.ACE_FIELD ? { field: env.ACE_FIELD } : {}),
-		activation: "default",
-	};
-}
-
-/** Inputs, their activation default, and where they came from. */
-export interface ResolvedAceInputs {
-	inputs: InputConfig[];
-	defaultActivation?: ConcreteActivation;
-	/** Config path or `"environment"`, for logs and `/ace` output. */
-	source: string;
-}
-
-/**
- * Resolve the inputs a host should run: `.ace.json` (or `ACE_CONFIG`) first, then a single input
- * from `ACE_STREAM`.
- *
- * Throws {@link AceConfigError} when neither source configures an input, when the file is invalid,
- * or when it names an unsupported transport.
- */
-export function resolveAceInputs(options: {
+export function resolveAceConfig(options: {
 	cwd: string;
 	env?: Readonly<Record<string, string | undefined>>;
-}): ResolvedAceInputs {
-	const env = options.env ?? process.env;
-	const loaded = loadAceConfig({ cwd: options.cwd, env });
-	if (loaded) {
-		return {
-			inputs: loaded.config.inputs,
-			defaultActivation: loaded.config.defaultActivation,
-			source: loaded.source,
-		};
-	}
-
-	const fromEnvironment = inputFromEnvironment(env);
-	if (!fromEnvironment) {
+}): ResolvedAceConfig {
+	const loaded = loadAceConfig(options);
+	if (!loaded) {
 		throw new AceConfigError(
-			`no ${ACE_CONFIG_FILENAME} in ${options.cwd} and ACE_STREAM is unset; nothing to consume`,
+			`no ${ACE_CONFIG_FILENAME} in ${options.cwd}: create one (inputs to consume, optional outputs to publish to)`,
 		);
 	}
-	return { inputs: [fromEnvironment], source: "environment" };
+
+	return {
+		inputs: loaded.config.inputs,
+		outputs: loaded.config.outputs ?? [],
+		defaultActivation: loaded.config.defaultActivation,
+		sender: loaded.config.sender ?? `pi-${process.pid}`,
+		source: loaded.source,
+	};
 }
 
 /**
@@ -170,6 +237,38 @@ function createTransport(input: InputConfig, onError: (error: unknown) => void):
 		default:
 			throw new AceConfigError(
 				`input "${input.name}" uses unsupported transport "${input.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+			);
+	}
+}
+
+/**
+ * Create one publisher per configured output, keyed by output name (the key the publishing tool
+ * looks up).
+ */
+export function createPublishers(
+	outputs: readonly OutputConfig[],
+	options: { onError: (error: unknown) => void },
+): Record<string, AcePublisher> {
+	const publishers: Record<string, AcePublisher> = {};
+	for (const output of outputs) {
+		publishers[output.name] = createPublisher(output, options.onError);
+	}
+	return publishers;
+}
+
+function createPublisher(output: OutputConfig, onError: (error: unknown) => void): AcePublisher {
+	const subject = `output "${output.name}"`;
+	switch (output.transport) {
+		case "redis-streams":
+			return new RedisStreamsPublisher({
+				url: optionalStringField(output, "url", REDIS_STREAMS_DEFAULTS.url, subject),
+				stream: requiredStringField(output, "stream", subject),
+				field: optionalStringField(output, "field", REDIS_STREAMS_DEFAULTS.field, subject),
+				onError,
+			});
+		default:
+			throw new AceConfigError(
+				`output "${output.name}" uses unsupported transport "${output.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
 			);
 	}
 }
