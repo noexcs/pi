@@ -206,6 +206,18 @@ const runtime = new AceRuntime({ engine: adapter, inputs: [input], transports: {
 | `count` | `16` | Entries per `XREADGROUP` |
 | `blockMs` | `1000` | `XREADGROUP` block window; also bounds how fast `stop()` returns |
 
+Delivery model — what `group` selects (measured against a real broker):
+
+| Configuration | Every entry goes to | Use it for |
+|---|---|---|
+| Different groups on one stream | every group once (broadcast) | several agents that must each see all events |
+| One group, several consumers (`consumer` defaults to `ace-<pid>`) | exactly one consumer of that group (work sharing) | splitting a queue across workers |
+| No group (`XREAD`) | every reader independently, no ack, no PEL | not used by this adapter |
+
+A session that consumes a stream it also publishes to receives its own messages — give each direction its own
+stream (see [Talking to another agent](#talking-to-another-agent)) or filter by `sender` in the agent. A group is
+created at the stream tail (`$`) when it does not exist yet, so a fresh group only sees new events.
+
 Acknowledgement policy:
 
 | Situation | Result |
