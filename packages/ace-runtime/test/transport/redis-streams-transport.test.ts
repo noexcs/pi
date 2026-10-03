@@ -217,7 +217,7 @@ describe("RedisStreamsTransport with the ACE runtime", () => {
 		const runtime = new AceRuntime({
 			engine,
 			inputs: [redisInput],
-			transports: { "redis-streams": transport },
+			transports: { [redisInput.name]: transport },
 		});
 
 		await runtime.start();
@@ -236,7 +236,7 @@ describe("RedisStreamsTransport with the ACE runtime", () => {
 		const runtime = new AceRuntime({
 			engine,
 			inputs: [redisInput],
-			transports: { "redis-streams": transport },
+			transports: { [redisInput.name]: transport },
 			logger: { warn: (message) => logged.push(message) },
 		});
 

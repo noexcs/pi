@@ -55,7 +55,7 @@ const transport = new RedisStreamsTransport(input, {
 const runtime = new AceRuntime({
 	engine: new PiAdapter({ session, onRunError: (error) => console.error("[ACE] agent run failed:", error) }),
 	inputs: [input],
-	transports: { "redis-streams": transport },
+	transports: { [input.name]: transport },
 	logger: consoleAceLogger,
 });
 

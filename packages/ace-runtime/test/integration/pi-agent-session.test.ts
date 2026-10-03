@@ -42,7 +42,7 @@ describe("ACE runtime with a real Pi agent session", () => {
 		const runtime = new AceRuntime({
 			engine: adapter,
 			inputs: [inputConfig],
-			transports: { memory: transport },
+			transports: { [inputConfig.name]: transport },
 		});
 		cleanups.push(async () => {
 			await runtime.stop();

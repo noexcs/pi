@@ -9,9 +9,11 @@
 
 export * from "./agent/agent-engine.ts";
 export * from "./agent/pi-adapter.ts";
+export * from "./agent/pi-extension-adapter.ts";
 export * from "./logger.ts";
 export * from "./protocol/ace-message.ts";
 export * from "./protocol/validator.ts";
+export * from "./runtime/ace-config.ts";
 export * from "./runtime/ace-runtime.ts";
 export * from "./runtime/activation-resolver.ts";
 export * from "./runtime/event-dispatcher.ts";

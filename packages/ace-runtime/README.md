@@ -73,6 +73,73 @@ ACE_EVENT='{"aceVersion":"0.1","id":"e1","sender":"ci","activation":"immediate",
   ACE_MODEL=tailscale-zcs/Qwen3.8-27B npm run example:basic --workspace=ace-runtime
 ```
 
+## Inject events into a live Pi session
+
+The extension in [`extensions/ace.ts`](extensions/ace.ts) runs **inside** Pi and injects external events into the
+session you are chatting in — no separate runtime process, no second session.
+
+```bash
+# 1. describe where events come from (session working directory)
+cat > .ace.json <<'JSON'
+{
+  "defaultActivation": "next_turn",
+  "inputs": [
+    {
+      "name": "build-events",
+      "transport": "redis-streams",
+      "stream": "ace:events",
+      "group": "ace-pi",
+      "url": "redis://127.0.0.1:6379",
+      "activation": "next_turn"
+    }
+  ]
+}
+JSON
+
+# 2. start Pi with the extension
+pi --extension /path/to/ace-runtime/extensions/ace.ts
+
+# 3. publish from anywhere; the event lands in the running conversation
+redis-cli XADD ace:events '*' message \
+  '{"aceVersion":"0.1","id":"e1","sender":"ci","activation":"next_turn","body":"Build failed."}'
+```
+
+Load it permanently by copying or symlinking the file into `~/.pi/agent/extensions/` (or a project
+`.pi/extensions/`). `.ace.json` is read once per session: restart Pi or `/reload` after editing it. Set
+`ACE_CONFIG` to read it from another path.
+
+### `.ace.json`
+
+| Field | Meaning |
+|---|---|
+| `defaultActivation` | `immediate` \| `next_turn` \| `manual`; the RFC §8 fallback when neither input nor message decides |
+| `inputs[].name` | Input name; also the key its transport is registered under |
+| `inputs[].transport` | Transport kind; `redis-streams` is the only one implemented (RFC §4.1 names the others) |
+| `inputs[].activation` | Receiver override for this input (RFC §8); `default` delegates to the message |
+| remaining keys | Transport settings: `stream`, `group`, `url`, `consumer`, `field`, `count`, `blockMs` |
+
+Without `.ace.json` the extension falls back to `ACE_STREAM` (+ `ACE_GROUP`, `ACE_REDIS_URL`, `ACE_CONSUMER`,
+`ACE_FIELD`); `ACE_LOG=1` also logs runtime lines in modes without a UI.
+
+### What injection looks like
+
+| Effective activation | Pi idle | Pi running |
+|---|---|---|
+| `next_turn` | event starts a turn | queued with `followUp`, processed after the current run's pending work |
+| `immediate` | event starts a turn | queued with `steer`, processed at the current turn's next boundary |
+| `manual` | retained in memory, no turn | retained in memory, no turn |
+
+Pi resolves idle-vs-streaming itself for `sendUserMessage`, so the extension passes the delivery mode and lets Pi
+queue the event; the last action also shows on the status line (`ace: injecting id=… sender=… agent=running`).
+
+### `/ace` commands
+
+| Command | Effect |
+|---|---|
+| `/ace` | origin of the configuration, agent state, number of retained `manual` events |
+| `/ace pending` | list retained `manual` events (`sender/id: body`) |
+| `/ace activate <sender> <id>` | inject a retained event as `next_turn` |
+
 ## Transports
 
 `Transport` is the only seam between a broker and ACE: `start(handler)` / `stop()`. Broker metadata
@@ -148,7 +215,8 @@ client, and the transport, so the test suite drives a fake client.
 | `src/transport/` | `Transport` boundary, `InMemoryTransport`, `RedisStreamsTransport` (+ client interface / node-redis adapter) |
 | `src/agent/` | `AgentEngine` interface and `PiAdapter` |
 | `src/logger.ts` | log lines that never carry a message body |
-| `test/` | protocol, runtime, adapter unit tests and real-Pi-session integration tests |
+| `extensions/` | `ace.ts`: Pi extension that injects events into the session it runs in |
+| `test/` | protocol, runtime, adapter and transport unit tests, plus real-Pi-session integration tests |
 | `schema/` | normative ACE 0.1 JSON Schema |
 
 ## Protocol summary
@@ -175,6 +243,9 @@ otherwise                     → runtime default (next_turn)
 `immediate | next_turn | manual`.
 
 ## Activation semantics on Pi
+
+Both engines (the SDK adapter and the in-session extension) map activation the same way; the SDK one calls Pi
+directly, the extension passes Pi a delivery mode and lets the session decide.
 
 | Effective activation | Agent idle | Agent running |
 |---|---|---|
@@ -224,7 +295,10 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
   dynamic targets, bindings, result events and acknowledgement APIs are out of scope (design doc §27, §37).
 - A Redis entry whose handler failed stays in the group's pending entries list; there is no reclaim worker
   (`XAUTOCLAIM`) yet, and a failed read ends consumption until the transport is recreated.
-- `AceRuntime` rejects two inputs sharing one transport, because every message would then be dispatched twice.
+- `AceRuntime` registers transports by input name and rejects a transport instance shared by two inputs, because
+  every message would then be dispatched twice. Two inputs may use the same transport kind with different settings.
+- The extension engine's `waitForIdle()` resolves immediately: a session shutdown must not block the interactive UI
+  on a live turn.
 
 ## Implementation notes
 
@@ -235,6 +309,9 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
   drift.
 - `RedisStreamsTransport` depends on the `redis` package only inside `redis-streams-node-client.ts`; the transport
   talks to the narrow `RedisStreamsClient` interface, which is what tests substitute.
+- `.ace.json` is validated when it is read (kind, activation, transport settings), so a broken configuration fails
+  at session start with a message instead of mid-stream. `/ace` deliberately registers no argument completions:
+  an open completion popup swallows the first Enter in the TUI.
 - The Pi engine is the public `@earendil-works/pi-coding-agent` SDK. Pi core is untouched.
 
 ## Development

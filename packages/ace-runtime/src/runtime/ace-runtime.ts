@@ -13,7 +13,11 @@ export interface AceRuntimeOptions {
 	engine: AgentEngine;
 	/** Where messages come from and which activation the receiver forces (RFC §4.1, §8). */
 	inputs: readonly InputConfig[];
-	/** Transport instances by name; `InputConfig.transport` selects one. */
+	/**
+	 * Transport instances keyed by **input name**: each configured input reads from its own
+	 * transport, so two inputs may use the same transport kind (RFC §4.1) with different
+	 * settings — two Redis streams, for example.
+	 */
 	transports: Readonly<Record<string, Transport>>;
 	/** Fallback activation; ACE 0.1 requires `next_turn` when unset (RFC §8). */
 	defaultActivation?: ConcreteActivation;
@@ -35,7 +39,7 @@ export interface AceHandleResult extends DispatchResult {
 export class AceRuntime {
 	private readonly engine: AgentEngine;
 	private readonly inputs: readonly InputConfig[];
-	private readonly transports: Readonly<Record<string, Transport>>;
+	private readonly transportByInput: ReadonlyMap<string, Transport>;
 	private readonly defaultActivation: ConcreteActivation;
 	private readonly logger: AceLogger;
 	private readonly pendingEventStore = new PendingEventStore();
@@ -44,21 +48,32 @@ export class AceRuntime {
 
 	constructor(options: AceRuntimeOptions) {
 		this.inputs = options.inputs.map(validateInputConfig);
-		const seenTransports = new Set<string>();
+
+		const transportByInput = new Map<string, Transport>();
+		const usedTransports = new Set<Transport>();
 		for (const input of this.inputs) {
-			if (seenTransports.has(input.transport)) {
+			if (transportByInput.has(input.name)) {
+				throw new AceConfigError(`input name "${input.name}" is configured twice`);
+			}
+			const transport = options.transports[input.name];
+			if (!transport) {
 				throw new AceConfigError(
-					`transport "${input.transport}" is used by more than one input; ACE events would be delivered twice`,
+					`input "${input.name}" has no transport registered under its name (registered: ${
+						Object.keys(options.transports).join(", ") || "none"
+					})`,
 				);
 			}
-			seenTransports.add(input.transport);
-			if (!options.transports[input.transport]) {
-				throw new AceConfigError(`input "${input.name}" references unknown transport "${input.transport}"`);
+			if (usedTransports.has(transport)) {
+				throw new AceConfigError(
+					`transport of input "${input.name}" is already used by another input; its messages would be delivered twice`,
+				);
 			}
+			usedTransports.add(transport);
+			transportByInput.set(input.name, transport);
 		}
 
 		this.engine = options.engine;
-		this.transports = options.transports;
+		this.transportByInput = transportByInput;
 		this.defaultActivation = options.defaultActivation ?? DEFAULT_RUNTIME_ACTIVATION;
 		this.logger = options.logger ?? {};
 		this.dispatcher = new EventDispatcher(this.engine, this.pendingEventStore, this.logger);
@@ -70,7 +85,7 @@ export class AceRuntime {
 		this.started = true;
 		try {
 			for (const input of this.inputs) {
-				await this.transports[input.transport].start((raw) => this.deliver(raw, input));
+				await this.transportFor(input).start((raw) => this.deliver(raw, input));
 			}
 		} catch (error) {
 			// Do not claim to be started when a transport refused to connect.
@@ -87,7 +102,7 @@ export class AceRuntime {
 		if (!this.started) return;
 		this.started = false;
 		for (const input of this.inputs) {
-			await this.transports[input.transport].stop();
+			await this.transportFor(input).stop();
 		}
 		await this.engine.waitForIdle();
 		this.logger.info?.("[ACE] runtime stopped");
@@ -134,6 +149,12 @@ export class AceRuntime {
 		}
 		this.logger.info?.(`[ACE] activating id=${id} sender=${sender} input=${event.inputName}`);
 		await this.engine.inject(event.message, "next_turn");
+	}
+
+	private transportFor(input: InputConfig): Transport {
+		const transport = this.transportByInput.get(input.name);
+		if (!transport) throw new AceConfigError(`input "${input.name}" has no transport`);
+		return transport;
 	}
 
 	private async deliver(raw: unknown, input: InputConfig): Promise<void> {

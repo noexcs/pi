@@ -33,7 +33,7 @@ function setup(inputOverrides: Partial<InputConfig> = {}, defaultActivation?: "i
 	const runtime = new AceRuntime({
 		engine,
 		inputs: [input],
-		transports: { memory: transport },
+		transports: { [input.name]: transport },
 		logger,
 		defaultActivation,
 	});
@@ -210,18 +210,19 @@ describe("AceRuntime lifecycle and configuration", () => {
 		expect(waitForIdle).toHaveBeenCalled();
 	});
 
-	it("rejects an unknown transport reference", () => {
+	it("rejects an input without a registered transport", () => {
 		expect(
 			() =>
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
-					inputs: [{ name: "alerts", transport: "nats" }],
+					inputs: [{ name: "alerts", transport: "redis-streams" }],
 					transports: {},
 				}),
-		).toThrow(/unknown transport "nats"/);
+		).toThrow(/no transport registered under its name/);
 	});
 
-	it("rejects two inputs sharing one transport", () => {
+	it("rejects the same transport instance used by two inputs", () => {
+		const shared = new InMemoryTransport();
 		expect(
 			() =>
 				new AceRuntime({
@@ -230,9 +231,47 @@ describe("AceRuntime lifecycle and configuration", () => {
 						{ name: "builds", transport: "memory" },
 						{ name: "alerts", transport: "memory" },
 					],
-					transports: { memory: new InMemoryTransport() },
+					transports: { builds: shared, alerts: shared },
 				}),
-		).toThrow(/more than one input/);
+		).toThrow(/delivered twice/);
+	});
+
+	it("rejects a duplicated input name", () => {
+		expect(
+			() =>
+				new AceRuntime({
+					engine: new FakeAgentEngine(),
+					inputs: [
+						{ name: "builds", transport: "memory" },
+						{ name: "builds", transport: "memory" },
+					],
+					transports: { builds: new InMemoryTransport() },
+				}),
+		).toThrow(/configured twice/);
+	});
+
+	it("reads two inputs of the same transport kind from separate transports", async () => {
+		const engine = new FakeAgentEngine();
+		const builds = new InMemoryTransport();
+		const alerts = new InMemoryTransport();
+		const runtime = new AceRuntime({
+			engine,
+			inputs: [
+				{ name: "builds", transport: "redis-streams", stream: "ace:builds" },
+				{ name: "alerts", transport: "redis-streams", stream: "ace:alerts" },
+			],
+			transports: { builds, alerts },
+		});
+
+		await runtime.start();
+		await builds.publish({ ...validRaw, id: "evt_build" });
+		await alerts.publish({ ...validRaw, id: "evt_alert" });
+
+		expect(engine.injections.map((injection) => injection.message.id)).toEqual(["evt_build", "evt_alert"]);
+		expect(engine.injections.map((injection) => injection.message.sender)).toEqual([
+			"build-service",
+			"build-service",
+		]);
 	});
 
 	// Deliberately malformed configurations: the runtime rejects them at construction.
@@ -248,7 +287,7 @@ describe("AceRuntime lifecycle and configuration", () => {
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
 					inputs: [config],
-					transports: { memory: new InMemoryTransport() },
+					transports: { [String(config.name ?? "builds")]: new InMemoryTransport() },
 				}),
 		).toThrow(AceConfigError);
 	});

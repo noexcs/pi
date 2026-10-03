@@ -59,7 +59,8 @@
 		"packages/*/test/**/*",
 		"packages/coding-agent/examples/**/*",
 		"packages/agent/examples/**/*",
-		"packages/ace-runtime/examples/**/*"
+		"packages/ace-runtime/examples/**/*",
+		"packages/ace-runtime/extensions/**/*"
 	],
 	"exclude": ["**/dist/**", "packages/coding-agent/examples/extensions/gondolin/**"]
 }

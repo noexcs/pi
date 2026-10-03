@@ -66,7 +66,7 @@ const input: InputConfig = { name: "build-events", transport: "memory", activati
 const runtime = new AceRuntime({
 	engine: adapter,
 	inputs: [input],
-	transports: { memory: transport },
+	transports: { [input.name]: transport },
 	logger: consoleAceLogger,
 });
 
