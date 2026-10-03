@@ -65,6 +65,14 @@ A runnable version is [`examples/basic.ts`](examples/basic.ts):
 ACE_MODEL=tailscale-zcs/Qwen3.8-27B npm run example:basic --workspace=ace-runtime
 ```
 
+Set `ACE_EVENT` to publish your own message instead of the demo event (`manual` events are then activated
+explicitly, so all four activation values are observable from the command line):
+
+```bash
+ACE_EVENT='{"aceVersion":"0.1","id":"e1","sender":"ci","activation":"immediate","body":"Deploy failed."}' \
+  ACE_MODEL=tailscale-zcs/Qwen3.8-27B npm run example:basic --workspace=ace-runtime
+```
+
 ## Layout
 
 | Path | Role |
