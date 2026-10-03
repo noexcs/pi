@@ -1,0 +1,51 @@
+{
+	"name": "ace-runtime",
+	"version": "0.1.0",
+	"description": "ACE (Agent Context Event Protocol) 0.1 runtime: external events into a Pi agent context",
+	"private": true,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"schema",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsc -p tsconfig.build.json",
+		"test": "vitest --run",
+		"example:basic": "node examples/basic.ts"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "^1.0.1",
+		"@earendil-works/pi-ai": "^1.0.1"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"shx": "0.4.0",
+		"vitest": "4.1.11"
+	},
+	"keywords": [
+		"ace",
+		"agent",
+		"event",
+		"protocol"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/noexcs/pi.git",
+		"directory": "packages/ace-runtime"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

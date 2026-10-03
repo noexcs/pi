@@ -81,6 +81,7 @@ This monorepo contains the Pi CLI and its supporting libraries.
 | **[@earendil-works/pi-durable](packages/durable)** | Durable conversation, task, and document runtime |
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
+| **[ace-runtime](packages/ace-runtime)** | ACE (Agent Context Event Protocol) 0.1 runtime: external events drive agent work |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
