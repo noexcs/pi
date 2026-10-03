@@ -13,8 +13,8 @@ External World
       ▼
 ┌──────────────┐   raw message    ┌───────────────────────────────┐   AceMessage   ┌────────────┐
 │  Transport   │ ───────────────► │          ACE Runtime          │ ─────────────► │ PiAdapter  │
-│ Kafka/NATS/  │                  │ decode → validate → resolve   │                │            │
-│ memory       │ ◄─────────────── │ activation → dispatch         │                └─────┬──────┘
+│ InMemory /   │                  │ decode → validate → resolve   │                │            │
+│ Redis Streams│ ◄─────────────── │ activation → dispatch         │                └─────┬──────┘
 └──────────────┘  ack/retry/…     └───────────────────────────────┘                      │
                                                 │                                 ┌──────▼──────┐
                                      manual ────┘ stored events                   │ Pi session  │
@@ -73,13 +73,79 @@ ACE_EVENT='{"aceVersion":"0.1","id":"e1","sender":"ci","activation":"immediate",
   ACE_MODEL=tailscale-zcs/Qwen3.8-27B npm run example:basic --workspace=ace-runtime
 ```
 
+## Transports
+
+`Transport` is the only seam between a broker and ACE: `start(handler)` / `stop()`. Broker metadata
+(topic, subject, stream, group, entry ID, offset, consumer) stays inside the adapter and never becomes an
+ACE field (RFC §4). Two adapters ship today.
+
+### `InMemoryTransport`
+
+In-process, for tests and examples: `start(handler)`, `stop()`, `publish(raw)`. Nothing is durable, nothing is
+acknowledged.
+
+### `RedisStreamsTransport`
+
+Consumes from a Redis Stream consumer group (RFC §4, §17). Its settings come from the input config:
+
+```typescript
+const input: InputConfig = {
+	name: "build-events",
+	transport: "redis-streams",
+	stream: "ace:build-events",
+	group: "coding-agent",
+	// optional: url, consumer, field, count, blockMs
+	activation: "default",
+};
+const transport = new RedisStreamsTransport(input, {
+	onError: (error) => console.error("[ACE] redis streams error:", error),
+});
+const runtime = new AceRuntime({ engine: adapter, inputs: [input], transports: { "redis-streams": transport } });
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `stream` | required | Stream the consumer group reads |
+| `group` | required | Consumer group; created at the stream tail (`$`) if missing |
+| `url` | `redis://127.0.0.1:6379` | Broker URL |
+| `consumer` | `ace-<pid>` | Consumer name inside the group |
+| `field` | `message` | Stream entry field carrying the ACE message JSON |
+| `count` | `16` | Entries per `XREADGROUP` |
+| `blockMs` | `1000` | `XREADGROUP` block window; also bounds how fast `stop()` returns |
+
+Acknowledgement policy:
+
+| Situation | Result |
+|---|---|
+| Handler resolves (event accepted, including `manual` events stored) | entry is `XACK`ed |
+| Invalid ACE message | logged by the runtime, then `XACK`ed — a poison message never blocks the stream |
+| Handler rejects (injection or transport failure) | entry stays in the group's PEL |
+
+Producers publish the ACE envelope as JSON in the payload field:
+
+```bash
+redis-cli XADD ace:build-events '*' \
+  message '{"aceVersion":"0.1","id":"evt_1","sender":"ci","activation":"next_turn","body":"Build failed."}'
+```
+
+`examples/redis-streams.ts` runs this consumer against a real broker:
+
+```bash
+redis-server --port 6399 --daemonize yes --save '' --dir /tmp/ace-redis
+ACE_MODEL=tailscale-zcs/Qwen3.8-27B ACE_REDIS_URL=redis://127.0.0.1:6399 ACE_EXIT_AFTER=1 \
+  npm run example:redis --workspace=ace-runtime
+```
+
+Tests never need a broker: the adapter is split into a narrow `RedisStreamsClient` interface, a `redis`-backed
+client, and the transport, so the test suite drives a fake client.
+
 ## Layout
 
 | Path | Role |
 |---|---|
 | `src/protocol/` | ACE 0.1 envelope, activation values, validator, decoder, [JSON Schema](schema/ace-message-0.1.schema.json) |
 | `src/runtime/` | input configuration, activation resolution, dispatcher, manual-event store, `AceRuntime` |
-| `src/transport/` | `Transport` boundary and `InMemoryTransport` |
+| `src/transport/` | `Transport` boundary, `InMemoryTransport`, `RedisStreamsTransport` (+ client interface / node-redis adapter) |
 | `src/agent/` | `AgentEngine` interface and `PiAdapter` |
 | `src/logger.ts` | log lines that never carry a message body |
 | `test/` | protocol, runtime, adapter unit tests and real-Pi-session integration tests |
@@ -154,8 +220,10 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
 
 - `manual` events live in process memory; a restart loses them (design doc §12). No persistence, no query API,
   no inbox API, no deduplication store.
-- `InMemoryTransport` only: Kafka/NATS adapters, a CLI, agent registry, dynamic targets, bindings, result events
-  and acknowledgement APIs are out of scope (design doc §27, §37).
+- Transports: `InMemoryTransport` and `RedisStreamsTransport`. Kafka/NATS adapters, a CLI, agent registry,
+  dynamic targets, bindings, result events and acknowledgement APIs are out of scope (design doc §27, §37).
+- A Redis entry whose handler failed stays in the group's pending entries list; there is no reclaim worker
+  (`XAUTOCLAIM`) yet, and a failed read ends consumption until the transport is recreated.
 - `AceRuntime` rejects two inputs sharing one transport, because every message would then be dispatched twice.
 
 ## Implementation notes
@@ -165,11 +233,15 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
   agent is idle; splitting them only adds a race window.
 - The validator is hand-written; `test/protocol/validator.test.ts` checks it against `schema/` so the two cannot
   drift.
+- `RedisStreamsTransport` depends on the `redis` package only inside `redis-streams-node-client.ts`; the transport
+  talks to the narrow `RedisStreamsClient` interface, which is what tests substitute.
 - The Pi engine is the public `@earendil-works/pi-coding-agent` SDK. Pi core is untouched.
 
 ## Development
 
 ```bash
-npm test --workspace=ace-runtime    # unit + integration tests (in-process faux model, no network)
+npm test --workspace=ace-runtime           # unit + integration tests (faux model, fake Redis client, no network)
 npm run build --workspace=ace-runtime
+npm run example:basic --workspace=ace-runtime   # in-memory transport, needs ACE_MODEL
+npm run example:redis --workspace=ace-runtime   # Redis Streams consumer, needs ACE_MODEL + a broker
 ```

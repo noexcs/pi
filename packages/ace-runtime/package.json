@@ -22,11 +22,13 @@
 		"clean": "shx rm -rf dist",
 		"build": "tsc -p tsconfig.build.json",
 		"test": "vitest --run",
-		"example:basic": "node examples/basic.ts"
+		"example:basic": "node examples/basic.ts",
+		"example:redis": "node examples/redis-streams.ts"
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "^1.0.1",
-		"@earendil-works/pi-ai": "^1.0.1"
+		"@earendil-works/pi-ai": "^1.0.1",
+		"redis": "6.3.0"
 	},
 	"devDependencies": {
 		"@types/node": "22.19.19",
