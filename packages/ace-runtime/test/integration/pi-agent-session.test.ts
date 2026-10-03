@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PiAdapter, renderAceEvent } from "../../src/agent/pi-adapter.ts";
 import type { AceMessage } from "../../src/protocol/ace-message.ts";
 import { AceRuntime } from "../../src/runtime/ace-runtime.ts";
-import type { InputConfig } from "../../src/runtime/input-config.ts";
+import type { EndpointConfig } from "../../src/runtime/endpoint-config.ts";
 import { InMemoryTransport } from "../../src/transport/in-memory-transport.ts";
 import { createTestPiSession, type TestPiSession } from "../support/pi-session.ts";
 
@@ -19,7 +19,7 @@ interface Harness {
 	adapter: PiAdapter;
 	runtime: AceRuntime;
 	transport: InMemoryTransport;
-	input: InputConfig;
+	input: EndpointConfig;
 	runErrors: unknown[];
 }
 
@@ -30,7 +30,7 @@ describe("ACE runtime with a real Pi agent session", () => {
 		while (cleanups.length > 0) await cleanups.pop()?.();
 	});
 
-	async function setup(input: Partial<InputConfig> = {}): Promise<Harness> {
+	async function setup(input: Partial<EndpointConfig> = {}): Promise<Harness> {
 		const pi = await createTestPiSession();
 		const transport = new InMemoryTransport();
 		const runErrors: unknown[] = [];
@@ -38,10 +38,17 @@ describe("ACE runtime with a real Pi agent session", () => {
 			session: pi.session,
 			onRunError: (error) => runErrors.push(error),
 		});
-		const inputConfig: InputConfig = { name: "build-events", transport: "memory", activation: "default", ...input };
+		const inputConfig: EndpointConfig = {
+			name: "build-events",
+			transport: "memory",
+			activation: "default",
+			...input,
+			config: input.config ?? {},
+			options: input.options ?? {},
+		};
 		const runtime = new AceRuntime({
 			engine: adapter,
-			inputs: [inputConfig],
+			subscribe: [inputConfig],
 			transports: { [inputConfig.name]: transport },
 		});
 		cleanups.push(async () => {
@@ -74,7 +81,7 @@ describe("ACE runtime with a real Pi agent session", () => {
 		const injected = await runtime.handleMessage(buildFailure, "build-events");
 		await pi.session.waitForIdle();
 
-		expect(injected).toEqual({ activation: "next_turn", disposition: "injected", inputName: "build-events" });
+		expect(injected).toEqual({ activation: "next_turn", disposition: "injected", subscriptionName: "build-events" });
 		expect(pi.requests).toHaveLength(1);
 	});
 

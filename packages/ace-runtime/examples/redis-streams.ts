@@ -21,17 +21,20 @@
  */
 
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { AceRuntime, consoleAceLogger, type InputConfig, PiAdapter, RedisStreamsTransport } from "../src/index.ts";
+import { AceRuntime, consoleAceLogger, type EndpointConfig, PiAdapter, RedisStreamsTransport } from "../src/index.ts";
 
-const input: InputConfig = {
+const subscription: EndpointConfig = {
 	name: "build-events",
 	transport: "redis-streams",
-	stream: process.env.ACE_STREAM ?? "ace:build-events",
-	group: process.env.ACE_GROUP ?? "ace-example",
-	...(process.env.ACE_REDIS_URL ? { url: process.env.ACE_REDIS_URL } : {}),
-	...(process.env.ACE_CONSUMER ? { consumer: process.env.ACE_CONSUMER } : {}),
-	...(process.env.ACE_FIELD ? { field: process.env.ACE_FIELD } : {}),
 	activation: "default",
+	options: {},
+	config: {
+		stream: process.env.ACE_STREAM ?? "ace:build-events",
+		group: process.env.ACE_GROUP ?? "ace-example",
+		...(process.env.ACE_REDIS_URL ? { url: process.env.ACE_REDIS_URL } : {}),
+		...(process.env.ACE_CONSUMER ? { consumer: process.env.ACE_CONSUMER } : {}),
+		...(process.env.ACE_FIELD ? { field: process.env.ACE_FIELD } : {}),
+	},
 };
 
 const exitAfter = Number.parseInt(process.env.ACE_EXIT_AFTER ?? "0", 10);
@@ -49,13 +52,13 @@ const { session } = await createAgentSession({
 	sessionManager: SessionManager.inMemory(),
 });
 
-const transport = new RedisStreamsTransport(input, {
+const transport = new RedisStreamsTransport(subscription, {
 	onError: (error) => console.error("[ACE] redis streams error:", error),
 });
 const runtime = new AceRuntime({
 	engine: new PiAdapter({ session, onRunError: (error) => console.error("[ACE] agent run failed:", error) }),
-	inputs: [input],
-	transports: { [input.name]: transport },
+	subscribe: [subscription],
+	transports: { [subscription.name]: transport },
 	logger: consoleAceLogger,
 });
 
@@ -78,7 +81,7 @@ process.once("SIGINT", () => interrupted.resolve());
 try {
 	await runtime.start();
 	console.log(
-		`[ACE] consuming stream=${input.stream} group=${input.group} (exit after ${exitAfter > 0 ? exitAfter : "∞"} turn(s))\n`,
+		`[ACE] consuming stream=${subscription.config.stream} group=${subscription.config.group} (exit after ${exitAfter > 0 ? exitAfter : "∞"} turn(s))\n`,
 	);
 
 	if (exitAfter > 0) {

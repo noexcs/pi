@@ -30,8 +30,8 @@ import {
 	AceRuntime,
 	consoleAceLogger,
 	decodeAceMessage,
+	type EndpointConfig,
 	InMemoryTransport,
-	type InputConfig,
 	PiAdapter,
 } from "../src/index.ts";
 
@@ -62,11 +62,17 @@ const adapter = new PiAdapter({
 	session,
 	onRunError: (error) => console.error("[ACE] agent run failed:", error),
 });
-const input: InputConfig = { name: "build-events", transport: "memory", activation: "default" };
+const subscription: EndpointConfig = {
+	name: "build-events",
+	transport: "memory",
+	activation: "default",
+	config: {},
+	options: {},
+};
 const runtime = new AceRuntime({
 	engine: adapter,
-	inputs: [input],
-	transports: { [input.name]: transport },
+	subscribe: [subscription],
+	transports: { [subscription.name]: transport },
 	logger: consoleAceLogger,
 });
 

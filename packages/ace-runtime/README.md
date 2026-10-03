@@ -31,7 +31,7 @@ metadata to ACE fields, and nothing here teaches Pi about ACE: Pi only sees cont
 
 ```typescript
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
-import { AceRuntime, InMemoryTransport, PiAdapter, type InputConfig } from "ace-runtime";
+import { AceRuntime, type EndpointConfig, InMemoryTransport, PiAdapter } from "ace-runtime";
 
 const { session } = await createAgentSession({ sessionManager: SessionManager.inMemory() });
 const transport = new InMemoryTransport();
@@ -39,12 +39,18 @@ const adapter = new PiAdapter({
 	session,
 	onRunError: (error) => console.error("[ACE] agent run failed:", error),
 });
-const input: InputConfig = { name: "build-events", transport: "memory", activation: "default" };
+const subscription: EndpointConfig = {
+	name: "build-events",
+	transport: "memory",
+	activation: "default",
+	config: {},
+	options: {},
+};
 
 const runtime = new AceRuntime({
 	engine: adapter,
-	inputs: [input],
-	transports: { memory: transport },
+	subscribe: [subscription],
+	transports: { [subscription.name]: transport },
 });
 
 await runtime.start();
@@ -82,16 +88,20 @@ session you are chatting in — no separate runtime process, no second session.
 # 1. every MQ setting lives in .ace.json (code holds the mechanisms, not the addresses)
 cat > .ace.json <<'JSON'
 {
+  "$schema": "/path/to/ace-runtime/schema/ace-config.schema.json",
   "sender": "agent-a",
   "defaultActivation": "next_turn",
-  "inputs": [
+  "subscribe": [
     {
-      "name": "build-events",
+      "name": "inbox",
       "transport": "redis-streams",
-      "stream": "ace:events",
-      "group": "ace-pi",
-      "url": "redis://127.0.0.1:6379",
-      "activation": "next_turn"
+      "description": "direct messages addressed to me",
+      "activation": "next_turn",
+      "config": {
+        "stream": "ace:in.a",
+        "group": "agent-a",
+        "url": "redis://127.0.0.1:6379"
+      }
     }
   ]
 }
@@ -113,13 +123,17 @@ Load it permanently by copying or symlinking the file into `~/.pi/agent/extensio
 
 | Field | Meaning |
 |---|---|
-| `sender` | Sender identifier this session publishes under (RFC §5.3); required once `outputs` exist, otherwise defaults to `pi-<pid>` |
-| `defaultActivation` | `immediate` \| `next_turn` \| `manual`; the RFC §8 fallback when neither input nor message decides |
-| `inputs[]` | Where events come from; `name` is the key its transport is registered under |
-| `outputs[]` | Where the `ace_publish` tool sends events; `name` is the target it is addressed by |
+| `sender` | Sender identifier this session publishes under (RFC §5.3); required once `publish` channels exist. Charset `[A-Za-z0-9._@:-]`, max 128 |
+| `defaultActivation` | `immediate` \| `next_turn` \| `manual`; the RFC §8 fallback when neither subscription nor message decides |
+| `subscribe[]` | Channels this agent receives events from; `name` is the key its transport is registered under |
+| `publish[]` | Channels the `ace_publish` tool may send to; `name` is the target the model passes |
 | `*.transport` | Transport kind; `redis-streams` is the only one implemented (RFC §4.1 names the others) |
-| `inputs[].activation` | Receiver override for this input (RFC §8); `default` delegates to the message |
-| remaining keys | Transport settings: `stream`, `group`, `url`, `consumer`, `field`, `count`, `blockMs` (publisher: everything but `group`, `consumer`, `count`, `blockMs`) |
+| `subscribe[].activation` | Receiver override for this channel (RFC §8); `default` delegates to the message. Not allowed on `publish` |
+| `*.description` | Who sits on the other end; shown to the model in the `ace_publish` description |
+| `*.enabled` | `false` keeps the channel configured but starts nothing for it (default `true`) |
+| `*.config` | Transport settings, validated against the kind; unknown keys are errors |
+| `*.options` | Raw options handed to the transport's client library; never validated |
+| `config.stream` … | redis-streams settings: `stream`, `group`, `url`, `consumer`, `field`, `count`, `blockMs` (publish: everything but `group`, `consumer`, `count`, `blockMs`) |
 
 `.ace.json` is the only source of MQ configuration — there is no environment fallback for addresses, streams, or
 groups. `ACE_CONFIG` selects a different config file path, `ACE_LOG=1` also logs runtime lines in modes without a
@@ -129,12 +143,12 @@ UI.
 autocomplete it after adding a `$schema` line:
 
 ```json
-{ "$schema": "./node_modules/ace-runtime/schema/ace-config.schema.json", "inputs": [ … ] }
+{ "$schema": "./node_modules/ace-runtime/schema/ace-config.schema.json", "subscribe": [ … ] }
 ```
 
-The schema covers structure, types, per-kind required keys, and "outputs need a sender". Two rules are semantic and
-stay in the validator: names must be unique within `inputs` and within `outputs`, and one transport instance cannot
-serve two inputs. `test/runtime/ace-config-schema.test.ts` fails when the schema and the validator disagree.
+The schema covers structure, types, per-kind required keys, and "publish needs a sender". Two rules are semantic and
+stay in the validator: names must be unique within `subscribe` and within `publish`, and one transport instance cannot
+serve two subscriptions. `test/runtime/ace-config-schema.test.ts` fails when the schema and the validator disagree.
 
 ### What injection looks like
 
@@ -167,6 +181,16 @@ agent A                                    agent B
 are configured — the address itself never travels in the message, RFC §4.1), and an optional `id` for correlation.
 The tool result reports the published id, sender, and target.
 
+### Session identity
+
+Every message this runtime publishes carries `sessionId` (RFC §5.4) — the Pi session id, which stays the same when a
+session is resumed and changes when a new one starts. That is how a peer notices that the other side's context has
+changed. Only the tail is shown (`sender: agent-a (session e7f1a9)`) because the leading characters of a uuidv7 are a
+timestamp that concurrent sessions share.
+
+The label is display-only: the protocol field keeps the full value, and neither the field nor the label is
+authorization (a peer can claim any `sessionId`, exactly like any `sender`). `/ace` prints the current label.
+
 ### `/ace` commands
 
 | Command | Effect |
@@ -190,21 +214,21 @@ acknowledged.
 
 ### `RedisStreamsTransport`
 
-Consumes from a Redis Stream consumer group (RFC §4, §17). Its settings come from the input config:
+Consumes from a Redis Stream consumer group (RFC §4, §17). Its settings come from the subscription config:
 
 ```typescript
-const input: InputConfig = {
+const subscription: EndpointConfig = {
 	name: "build-events",
 	transport: "redis-streams",
-	stream: "ace:build-events",
-	group: "coding-agent",
-	// optional: url, consumer, field, count, blockMs
 	activation: "default",
+	// every broker-specific setting lives in `config`; raw client options go to `options`
+	config: { stream: "ace:build-events", group: "coding-agent" },
+	options: {},
 };
-const transport = new RedisStreamsTransport(input, {
+const transport = new RedisStreamsTransport(subscription, {
 	onError: (error) => console.error("[ACE] redis streams error:", error),
 });
-const runtime = new AceRuntime({ engine: adapter, inputs: [input], transports: { "redis-streams": transport } });
+const runtime = new AceRuntime({ engine: adapter, subscribe: [subscription], transports: { [subscription.name]: transport } });
 ```
 
 | Key | Default | Meaning |
@@ -260,7 +284,7 @@ client, and the transport, so the test suite drives a fake client.
 | Path | Role |
 |---|---|
 | `src/protocol/` | ACE 0.1 envelope, activation values, validator, decoder, [JSON Schema](schema/ace-message-0.1.schema.json) |
-| `src/runtime/` | input configuration, activation resolution, dispatcher, manual-event store, `AceRuntime` |
+| `src/runtime/` | endpoint (subscribe/publish) configuration, activation resolution, dispatcher, manual-event store, `AceRuntime` |
 | `src/transport/` | `Transport` boundary, `InMemoryTransport`, `RedisStreamsTransport` (+ client interface / node-redis adapter) |
 | `src/agent/` | `AgentEngine` interface and `PiAdapter` |
 | `src/logger.ts` | log lines that never carry a message body |
@@ -283,7 +307,7 @@ An ACE 0.1 message is exactly five fields; unknown fields are allowed and ignore
 Effective activation (RFC §8) — the receiver can always override the sender:
 
 ```text
-input.activation != default  → input.activation
+subscribe.activation != default  → subscribe.activation
 message.activation != default → message.activation
 otherwise                     → runtime default (next_turn)
 ```
@@ -316,7 +340,7 @@ the session settles. Events therefore reach the model exactly once, in order.
 
 ```text
 [ACE Event]
-sender: build-service
+sender: agent-a (session e7f1a9)
 id: evt_123
 
 Build failed for project foo.
@@ -335,7 +359,7 @@ Pass `renderEvent` to `PiAdapter` to change the format.
 | Unreachable broker | the start fails once with the URL; reconnection is bounded and an outage after the start is reported at most once until commands succeed again |
 | Agent turn failure | reported through `PiAdapter`'s `onRunError`, since Pi records it on the assistant message rather than rejecting `prompt()` |
 
-Log lines carry `id`, `sender`, `input`, and `activation` only — never the body.
+Log lines carry `id`, `sender`, `subscribe`, and `activation` only — never the body.
 
 ## MVP limitations
 
@@ -346,8 +370,10 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
 - A Redis entry whose handler failed stays in the group's pending entries list; there is no reclaim worker
   (`XAUTOCLAIM`) yet, and a failed read ends consumption until the transport is recreated.
 - The runtime does not reconnect in the background: start the broker, then restart Pi (or recreate the transport).
-- `AceRuntime` registers transports by input name and rejects a transport instance shared by two inputs, because
-  every message would then be dispatched twice. Two inputs may use the same transport kind with different settings.
+- `sender` and `sessionId` are claims: the broker's own permissions decide who may write a channel (see the security
+  notes), but the runtime cannot verify that a peer is who it says it is.
+- `AceRuntime` registers transports by subscription name and rejects a transport instance shared by two subscriptions,
+  because every message would then be dispatched twice. Two subscriptions may use the same transport kind with different settings.
 - The extension engine's `waitForIdle()` resolves immediately: a session shutdown must not block the interactive UI
   on a live turn.
 

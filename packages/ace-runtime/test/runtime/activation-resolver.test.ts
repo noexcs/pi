@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Activation, ConcreteActivation } from "../../src/protocol/ace-message.ts";
 import { DEFAULT_RUNTIME_ACTIVATION, resolveActivation } from "../../src/runtime/activation-resolver.ts";
-import type { InputConfig } from "../../src/runtime/input-config.ts";
+import type { EndpointConfig } from "../../src/runtime/endpoint-config.ts";
 
 function message(activation: Activation) {
 	return { aceVersion: "0.1" as const, id: "evt_1", sender: "agent-ci", activation, body: "Build failed." };
 }
 
-function input(activation?: Activation): InputConfig {
-	return { name: "build-events", transport: "memory", activation };
+function input(activation?: Activation): EndpointConfig {
+	return { name: "build-events", transport: "memory", activation, config: {}, options: {} };
 }
 
 describe("resolveActivation (RFC §8)", () => {

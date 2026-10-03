@@ -30,18 +30,22 @@ export class EventDispatcher {
 		this.logger = logger;
 	}
 
-	async dispatch(message: AceMessage, inputName: string, activation: ConcreteActivation): Promise<DispatchResult> {
+	async dispatch(
+		message: AceMessage,
+		subscriptionName: string,
+		activation: ConcreteActivation,
+	): Promise<DispatchResult> {
 		if (activation === "manual") {
-			this.pendingEvents.store(message, inputName);
+			this.pendingEvents.store(message, subscriptionName);
 			this.logger.info?.(
-				`[ACE] stored id=${message.id} sender=${message.sender} input=${inputName} activation=manual`,
+				`[ACE] stored id=${message.id} sender=${message.sender} input=${subscriptionName} activation=manual`,
 			);
 			return { activation, disposition: "stored" };
 		}
 
 		const running = this.engine.isRunning();
 		this.logger.info?.(
-			`[ACE] injecting id=${message.id} sender=${message.sender} input=${inputName} activation=${activation} agent=${
+			`[ACE] injecting id=${message.id} sender=${message.sender} input=${subscriptionName} activation=${activation} agent=${
 				running ? "running" : "idle"
 			}`,
 		);

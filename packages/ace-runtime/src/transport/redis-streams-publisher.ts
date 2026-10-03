@@ -1,4 +1,4 @@
-import { createClient } from "redis";
+import { createClient, type RedisClientOptions } from "redis";
 import type { AceMessage } from "../protocol/ace-message.ts";
 import { validateAceMessage } from "../protocol/validator.ts";
 
@@ -34,10 +34,19 @@ function describeError(error: unknown): string {
  * Connects on the first publish so a session can start while a publish target is down; failures
  * are reported through `onError` at most once per outage, and reconnection is bounded.
  */
-export function createRedisStreamsAddClient(url: string, onError: (error: unknown) => void): RedisStreamsAddClient {
+export function createRedisStreamsAddClient(
+	url: string,
+	onError: (error: unknown) => void,
+	clientOptions: Record<string, unknown> = {},
+): RedisStreamsAddClient {
+	// Operator-supplied passthrough (`.ace.json` `options`); see the consumer client for the rationale.
+	const operatorOptions = clientOptions as RedisClientOptions;
+	const operatorSocket = typeof operatorOptions.socket === "object" ? operatorOptions.socket : {};
 	const client = createClient({
+		...operatorOptions,
 		url,
 		socket: {
+			...operatorSocket,
 			reconnectStrategy: (retries) =>
 				retries > MAX_RECONNECT_ATTEMPTS ? new Error(`${url} is unreachable`) : retries * RECONNECT_DELAY_MS,
 		},
@@ -75,6 +84,8 @@ export interface RedisStreamsPublisherOptions {
 	field: string;
 	/** Injected client; defaults to a `redis` client for `url`. */
 	client?: RedisStreamsAddClient;
+	/** Raw client options passed through to the `redis` package. */
+	clientOptions?: Record<string, unknown>;
 	/** Called when the broker connection fails. */
 	onError?: (error: unknown) => void;
 }
@@ -93,13 +104,17 @@ export class RedisStreamsPublisher implements AcePublisher {
 		this.onError = options.onError ?? (() => {});
 		this.client =
 			options.client ??
-			createRedisStreamsAddClient(options.url, (error) => {
-				try {
-					this.onError(error);
-				} catch {
-					// A failing error hook must not break publishing.
-				}
-			});
+			createRedisStreamsAddClient(
+				options.url,
+				(error) => {
+					try {
+						this.onError(error);
+					} catch {
+						// A failing error hook must not break publishing.
+					}
+				},
+				options.clientOptions,
+			);
 	}
 
 	/** Validate before emitting: this runtime never publishes a non-conforming message (RFC §13). */

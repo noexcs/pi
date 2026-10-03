@@ -13,11 +13,13 @@ import type { Transport } from "../transport/transport.ts";
 import { describeValue, isPlainObject } from "../utils.ts";
 import {
 	AceConfigError,
-	type InputConfig,
+	type EndpointConfig,
 	optionalStringField,
+	rejectUnknownKeys,
 	requiredStringField,
-	validateInputConfig,
-} from "./input-config.ts";
+	validateEndpointConfig,
+	validateSender,
+} from "./endpoint-config.ts";
 
 /**
  * Name of the runtime configuration file read from the session working directory.
@@ -30,27 +32,25 @@ export const ACE_CONFIG_FILENAME = ".ace.json";
 /** Transport kinds this runtime can build from configuration (RFC §4.1 lists the others). */
 export const SUPPORTED_TRANSPORTS: readonly string[] = ["redis-streams"];
 
+/** The key that identifies a channel inside its broker; used to spot duplicated subscriptions. */
+const ADDRESS_KEY_BY_TRANSPORT: Record<string, string> = { "redis-streams": "stream" };
+
 /**
  * Runtime configuration (RFC §10) as stored in {@link ACE_CONFIG_FILENAME}.
  *
- * Not an ACE protocol object: transports and their addresses are deployment settings, and an
- * ACE message never carries them (RFC §4).
+ * `subscribe` and `publish` use the vocabulary of MQ APIs (MQTT/AsyncAPI operations): from this
+ * runtime's point of view, `subscribe` lists the channels it receives events from and `publish`
+ * the channels its tools may send to.
  */
 export interface AceConfigFile {
-	/** Fallback activation for inputs and messages that delegate with `default` (RFC §8). */
+	/** Fallback activation for subscriptions and messages that delegate with `default` (RFC §8). */
 	defaultActivation?: ConcreteActivation;
-	/** Sender identifier this session publishes under (RFC §5.3); required once `outputs` exist. */
+	/** Sender identifier this session publishes under (RFC §5.3); required once `publish` exists. */
 	sender?: string;
-	inputs: InputConfig[];
-	/** Publishing targets (RFC §19); the address stays here, never in the message (§4.1). */
-	outputs?: OutputConfig[];
-}
-
-/** A publishing target: the keys of an input (`name`, `transport`, address, …) minus consumer-only ones. */
-export interface OutputConfig {
-	name: string;
-	transport: string;
-	[key: string]: unknown;
+	/** Channels this runtime receives ACE events from. */
+	subscribe: EndpointConfig[];
+	/** Channels this runtime may send ACE events to (RFC §19); the address stays here (§4.1). */
+	publish?: EndpointConfig[];
 }
 
 export interface LoadedAceConfig {
@@ -59,13 +59,19 @@ export interface LoadedAceConfig {
 	config: AceConfigFile;
 }
 
-/** Inputs, publishing targets, identity, the activation default, and where they came from. */
+/** Subscriptions, publications, identity, the activation default, and where they came from. */
 export interface ResolvedAceConfig {
-	inputs: InputConfig[];
-	outputs: OutputConfig[];
+	/** Enabled subscriptions only. */
+	subscribe: EndpointConfig[];
+	/** Enabled publications only. */
+	publish: EndpointConfig[];
+	/** Channel names skipped because `enabled` is false. */
+	disabled: string[];
 	defaultActivation?: ConcreteActivation;
-	/** `pi-<pid>` when the configuration does not name one. */
-	sender: string;
+	/** Sender identity; absent when the configuration has no `publish` channels. */
+	sender?: string;
+	/** Configuration smells that are legal but almost always mistakes. */
+	warnings: string[];
 	source: string;
 }
 
@@ -75,100 +81,109 @@ export function parseAceConfig(value: unknown, source: string): AceConfigFile {
 		throw new AceConfigError(`${source} must contain a JSON object, received ${describeValue(value)}`);
 	}
 
-	const { defaultActivation, inputs, sender } = value;
+	const { defaultActivation, subscribe, sender } = value;
 	if (defaultActivation !== undefined && !isConcreteActivation(defaultActivation)) {
 		throw new AceConfigError(
 			`${source}: defaultActivation must be immediate|next_turn|manual, received ${describeValue(defaultActivation)}`,
 		);
 	}
-	if (!Array.isArray(inputs) || inputs.length === 0) {
-		throw new AceConfigError(`${source}: inputs must be a non-empty array`);
-	}
-	if (sender !== undefined && (typeof sender !== "string" || sender.length === 0)) {
-		throw new AceConfigError(`${source}: sender must be a non-empty string, received ${describeValue(sender)}`);
+	if (!Array.isArray(subscribe) || subscribe.length === 0) {
+		throw new AceConfigError(`${source}: subscribe must be a non-empty array`);
 	}
 
-	const parsedInputs = inputs.map(validateInputConfig);
-	const inputNames = new Set<string>();
-	for (const input of parsedInputs) {
-		if (inputNames.has(input.name))
-			throw new AceConfigError(`${source}: input name "${input.name}" is configured twice`);
-		inputNames.add(input.name);
-		validateTransportSettings(input);
+	const subscriptions = parseEndpoints(subscribe, source, "subscribe");
+	for (const subscription of subscriptions) validateSubscriptionSettings(subscription);
+
+	const publications = value.publish === undefined ? undefined : parseEndpoints(value.publish, source, "publish");
+	if (publications) {
+		for (const publication of publications) validatePublicationSettings(publication);
 	}
 
-	const parsedOutputs = parseOutputs(value.outputs, source);
-	if (parsedOutputs && sender === undefined) {
-		throw new AceConfigError(`${source}: sender is required when outputs are configured (peers identify you by it)`);
+	if (sender !== undefined && publications) validateSender(sender, source);
+	if (publications && sender === undefined) {
+		throw new AceConfigError(`${source}: sender is required when publish is configured (peers identify you by it)`);
 	}
 
 	return {
 		defaultActivation,
-		...(sender === undefined ? {} : { sender }),
-		inputs: parsedInputs,
-		...(parsedOutputs ? { outputs: parsedOutputs } : {}),
+		...(sender === undefined ? {} : { sender: sender as string }),
+		subscribe: subscriptions,
+		...(publications ? { publish: publications } : {}),
 	};
 }
 
-function parseOutputs(value: unknown, source: string): OutputConfig[] | undefined {
-	if (value === undefined) return undefined;
+function parseEndpoints(value: unknown, source: string, role: "subscribe" | "publish"): EndpointConfig[] {
 	if (!Array.isArray(value) || value.length === 0) {
-		throw new AceConfigError(`${source}: outputs must be a non-empty array when present`);
+		throw new AceConfigError(`${source}: ${role} must be a non-empty array when present`);
 	}
 
-	const outputs = value.map((entry) => validateOutputConfig(entry));
+	const endpoints = value.map((entry) => validateEndpointConfig(entry, role));
 	const names = new Set<string>();
-	for (const output of outputs) {
-		if (names.has(output.name))
-			throw new AceConfigError(`${source}: output name "${output.name}" is configured twice`);
-		names.add(output.name);
-		validateOutputSettings(output);
+	for (const endpoint of endpoints) {
+		if (names.has(endpoint.name))
+			throw new AceConfigError(`${source}: ${role} name "${endpoint.name}" is configured twice`);
+		names.add(endpoint.name);
 	}
-	return outputs;
+	return endpoints;
 }
 
-/** Validate one publishing target: same structure as an input, without consumer settings. */
-export function validateOutputConfig(value: unknown): OutputConfig {
-	if (!isPlainObject(value)) {
-		throw new AceConfigError(`output config must be an object, received ${describeValue(value)}`);
-	}
-
-	const { name, transport } = value;
-	if (typeof name !== "string" || name.length === 0) {
-		throw new AceConfigError("output config requires a non-empty name");
-	}
-	if (typeof transport !== "string" || transport.length === 0) {
-		throw new AceConfigError(`output "${name}" requires a non-empty transport`);
-	}
-	return { ...value, name, transport };
-}
-
-function validateOutputSettings(output: OutputConfig): void {
-	const subject = `output "${output.name}"`;
-	switch (output.transport) {
+/** Reject unknown transport kinds and invalid settings for one subscription. */
+function validateSubscriptionSettings(subscription: EndpointConfig): void {
+	switch (subscription.transport) {
 		case "redis-streams":
-			requiredStringField(output, "stream", subject);
-			optionalStringField(output, "url", REDIS_STREAMS_DEFAULTS.url, subject);
-			optionalStringField(output, "field", REDIS_STREAMS_DEFAULTS.field, subject);
+			redisStreamsConfigFrom(subscription);
 			return;
 		default:
 			throw new AceConfigError(
-				`output "${output.name}" uses unsupported transport ${describeValue(output.transport)} (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+				`subscribe "${subscription.name}" uses unsupported transport ${describeValue(subscription.transport)} (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
 			);
 	}
 }
 
-/** Reject unknown transport kinds and invalid transport settings while reading the file. */
-function validateTransportSettings(input: InputConfig): void {
-	switch (input.transport) {
+/** Reject unknown transport kinds and invalid settings for one publication. */
+function validatePublicationSettings(publication: EndpointConfig): void {
+	const subject = `publish "${publication.name}" config`;
+	switch (publication.transport) {
 		case "redis-streams":
-			redisStreamsConfigFrom(input);
+			requiredStringField(publication.config, "stream", subject);
+			optionalStringField(publication.config, "url", REDIS_STREAMS_DEFAULTS.url, subject);
+			optionalStringField(publication.config, "field", REDIS_STREAMS_DEFAULTS.field, subject);
+			rejectUnknownKeys(publication.config, ["stream", "url", "field"], subject);
 			return;
 		default:
 			throw new AceConfigError(
-				`input "${input.name}" uses unsupported transport ${describeValue(input.transport)} (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+				`publish "${publication.name}" uses unsupported transport ${describeValue(publication.transport)} (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
 			);
 	}
+}
+
+/**
+ * Configuration smells that are legal but almost always mistakes: more than one subscription reading
+ * the same address from one agent either splits the events or delivers every event twice.
+ */
+export function channelWarnings(config: AceConfigFile): string[] {
+	const byAddress = new Map<string, EndpointConfig[]>();
+	for (const subscription of config.subscribe) {
+		const addressKey = ADDRESS_KEY_BY_TRANSPORT[subscription.transport];
+		if (!addressKey) continue;
+		const address = subscription.config[addressKey];
+		if (typeof address !== "string") continue;
+		const key = `${subscription.transport} ${address}`;
+		byAddress.set(key, [...(byAddress.get(key) ?? []), subscription]);
+	}
+
+	const warnings: string[] = [];
+	for (const [key, subscriptions] of byAddress) {
+		if (subscriptions.length < 2) continue;
+		const names = subscriptions.map((subscription) => `"${subscription.name}"`).join(" and ");
+		const groups = new Set(subscriptions.map((subscription) => String(subscription.config.group)));
+		warnings.push(
+			groups.size === 1
+				? `subscribe ${names} read ${key} in the same group: events are split between them`
+				: `subscribe ${names} read ${key} with different groups: this agent receives every event twice`,
+		);
+	}
+	return warnings;
 }
 
 /**
@@ -199,7 +214,8 @@ export function loadAceConfig(options: {
  * Resolve everything a host needs to run ACE in a session.
  *
  * MQ configuration comes from `.ace.json` only — `ACE_CONFIG` selects a different file path, but
- * there is no environment-variable fallback for addresses, streams, or groups.
+ * there is no environment-variable fallback for addresses, streams, or groups. Disabled channels are
+ * filtered out here so no transport is ever started for them.
  */
 export function resolveAceConfig(options: {
 	cwd: string;
@@ -208,73 +224,82 @@ export function resolveAceConfig(options: {
 	const loaded = loadAceConfig(options);
 	if (!loaded) {
 		throw new AceConfigError(
-			`no ${ACE_CONFIG_FILENAME} in ${options.cwd}: create one (inputs to consume, optional outputs to publish to)`,
+			`no ${ACE_CONFIG_FILENAME} in ${options.cwd}: create one (subscribe channels to consume, optional publish channels)`,
 		);
 	}
 
+	const { config, source } = loaded;
+	const isEnabled = (endpoint: EndpointConfig) => endpoint.enabled !== false;
+	const disabled = [...config.subscribe, ...(config.publish ?? [])]
+		.filter((endpoint) => !isEnabled(endpoint))
+		.map((endpoint) => endpoint.name);
+
 	return {
-		inputs: loaded.config.inputs,
-		outputs: loaded.config.outputs ?? [],
-		defaultActivation: loaded.config.defaultActivation,
-		sender: loaded.config.sender ?? `pi-${process.pid}`,
-		source: loaded.source,
+		subscribe: config.subscribe.filter(isEnabled),
+		publish: (config.publish ?? []).filter(isEnabled),
+		disabled,
+		defaultActivation: config.defaultActivation,
+		...(config.sender === undefined ? {} : { sender: config.sender }),
+		warnings: channelWarnings(config),
+		source,
 	};
 }
 
 /**
- * Create one transport per configured input, keyed by input name (the key
+ * Create one transport per subscription, keyed by subscription name (the key
  * {@link AceRuntime} expects).
  */
 export function createTransports(
-	inputs: readonly InputConfig[],
+	subscriptions: readonly EndpointConfig[],
 	options: { onError: (error: unknown) => void },
 ): Record<string, Transport> {
 	const transports: Record<string, Transport> = {};
-	for (const input of inputs) {
-		transports[input.name] = createTransport(input, options.onError);
+	for (const subscription of subscriptions) {
+		transports[subscription.name] = createTransport(subscription, options.onError);
 	}
 	return transports;
 }
 
-function createTransport(input: InputConfig, onError: (error: unknown) => void): Transport {
-	switch (input.transport) {
+function createTransport(subscription: EndpointConfig, onError: (error: unknown) => void): Transport {
+	switch (subscription.transport) {
 		case "redis-streams":
-			return new RedisStreamsTransport(input, { onError });
+			return new RedisStreamsTransport(subscription, { onError });
 		default:
 			throw new AceConfigError(
-				`input "${input.name}" uses unsupported transport "${input.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+				`subscribe "${subscription.name}" uses unsupported transport "${subscription.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
 			);
 	}
 }
 
 /**
- * Create one publisher per configured output, keyed by output name (the key the publishing tool
+ * Create one publisher per publication, keyed by publication name (the key the publishing tool
  * looks up).
  */
 export function createPublishers(
-	outputs: readonly OutputConfig[],
+	publications: readonly EndpointConfig[],
 	options: { onError: (error: unknown) => void },
 ): Record<string, AcePublisher> {
 	const publishers: Record<string, AcePublisher> = {};
-	for (const output of outputs) {
-		publishers[output.name] = createPublisher(output, options.onError);
+	for (const publication of publications) {
+		publishers[publication.name] = createPublisher(publication, options.onError);
 	}
 	return publishers;
 }
 
-function createPublisher(output: OutputConfig, onError: (error: unknown) => void): AcePublisher {
-	const subject = `output "${output.name}"`;
-	switch (output.transport) {
+function createPublisher(publication: EndpointConfig, onError: (error: unknown) => void): AcePublisher {
+	const subject = `publish "${publication.name}" config`;
+	switch (publication.transport) {
 		case "redis-streams":
 			return new RedisStreamsPublisher({
-				url: optionalStringField(output, "url", REDIS_STREAMS_DEFAULTS.url, subject),
-				stream: requiredStringField(output, "stream", subject),
-				field: optionalStringField(output, "field", REDIS_STREAMS_DEFAULTS.field, subject),
+				url: optionalStringField(publication.config, "url", REDIS_STREAMS_DEFAULTS.url, subject),
+				stream: requiredStringField(publication.config, "stream", subject),
+				field: optionalStringField(publication.config, "field", REDIS_STREAMS_DEFAULTS.field, subject),
+				clientOptions: publication.options,
 				onError,
 			});
 		default:
 			throw new AceConfigError(
-				`output "${output.name}" uses unsupported transport "${output.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
+				`publish "${publication.name}" uses unsupported transport "${publication.transport}" (available: ${SUPPORTED_TRANSPORTS.join(", ")})`,
 			);
 	}
 }

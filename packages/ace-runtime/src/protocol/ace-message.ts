@@ -32,13 +32,17 @@ export const CONCRETE_ACTIVATIONS: readonly ConcreteActivation[] = ["immediate",
  * ACE 0.1 message envelope (RFC §5, §12).
  *
  * - `body` is an opaque string; ACE never interprets it (RFC §6).
- * - `(sender, id)` is the message identity (RFC §5.2).
+ * - `(sender, id)` identifies the message, `(sender, sessionId)` the sender's
+ *   conversation/instance (RFC §5.2) — `sessionId` is deliberately unstable across sessions and
+ *   never an authorization credential.
  * - Unknown fields are allowed and must be ignored (RFC §15).
  */
 export interface AceMessage {
 	aceVersion: AceVersion;
 	id: string;
 	sender: string;
+	/** Sender's session/instance identifier (RFC §5.4); optional, opaque, deployment-defined. */
+	sessionId?: string;
 	activation: Activation;
 	body: string;
 	[key: string]: unknown;

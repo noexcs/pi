@@ -4,22 +4,22 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ACE_CONFIG_FILENAME,
+	channelWarnings,
 	createPublishers,
 	createTransports,
 	loadAceConfig,
 	parseAceConfig,
 	resolveAceConfig,
 } from "../../src/runtime/ace-config.ts";
-import { AceConfigError } from "../../src/runtime/input-config.ts";
+import { AceConfigError } from "../../src/runtime/endpoint-config.ts";
 
-const buildInput = {
-	name: "build-events",
+const inbox = {
+	name: "inbox",
 	transport: "redis-streams",
-	stream: "ace:events",
-	group: "ace-pi",
+	config: { stream: "ace:in.a", group: "agent-a" },
+	options: {},
 };
-
-const peerOutput = { name: "to-b", transport: "redis-streams", stream: "ace:to-b" };
+const toB = { name: "to-b", transport: "redis-streams", config: { stream: "ace:in.b" }, options: {} };
 
 const directories: string[] = [];
 
@@ -40,42 +40,72 @@ afterEach(() => {
 });
 
 describe("parseAceConfig", () => {
-	it("accepts inputs and a default activation", () => {
-		expect(parseAceConfig({ defaultActivation: "immediate", inputs: [buildInput] }, ".ace.json")).toEqual({
+	it("accepts a subscription and a default activation", () => {
+		expect(parseAceConfig({ defaultActivation: "immediate", subscribe: [inbox] }, ".ace.json")).toEqual({
 			defaultActivation: "immediate",
-			inputs: [buildInput],
+			subscribe: [{ ...inbox }],
 		});
 	});
 
-	it("accepts outputs together with a sender", () => {
-		expect(parseAceConfig({ sender: "agent-a", inputs: [buildInput], outputs: [peerOutput] }, ".ace.json")).toEqual({
-			sender: "agent-a",
-			inputs: [buildInput],
-			outputs: [peerOutput],
-		});
+	it("accepts publish channels with a sender and keeps options", () => {
+		const parsed = parseAceConfig(
+			{
+				sender: "agent-a",
+				subscribe: [inbox],
+				publish: [{ ...toB, options: { socket: { connectTimeout: 5000 } } }],
+			},
+			".ace.json",
+		);
+
+		expect(parsed.sender).toBe("agent-a");
+		expect(parsed.publish?.[0]?.options).toEqual({ socket: { connectTimeout: 5000 } });
+	});
+
+	it("accepts enabled: false and keeps it on the entry", () => {
+		expect(parseAceConfig({ subscribe: [{ ...inbox, enabled: false }] }, ".ace.json").subscribe[0]?.enabled).toBe(
+			false,
+		);
 	});
 
 	it.each([
 		["a non-object document", ["not", "an", "object"]],
-		["a delegated defaultActivation", { defaultActivation: "default", inputs: [buildInput] }],
-		["missing inputs", { defaultActivation: "next_turn" }],
-		["empty inputs", { inputs: [] }],
-		["an unsupported input transport", { inputs: [{ ...buildInput, transport: "kafka" }] }],
-		["an input without a stream", { inputs: [{ name: "builds", transport: "redis-streams", group: "g" }] }],
-		["an empty sender", { sender: "", inputs: [buildInput] }],
-		["outputs without a sender", { inputs: [buildInput], outputs: [peerOutput] }],
-		["empty outputs", { sender: "a", inputs: [buildInput], outputs: [] }],
-		["a duplicated output name", { sender: "a", inputs: [buildInput], outputs: [peerOutput, peerOutput] }],
+		["a delegated defaultActivation", { defaultActivation: "default", subscribe: [inbox] }],
+		["missing subscribe", { defaultActivation: "next_turn" }],
+		["empty subscribe", { subscribe: [] }],
+		["an unsupported transport", { subscribe: [{ ...inbox, transport: "kafka" }] }],
+		["an unknown transport kind", { subscribe: [{ name: "x", transport: "kafka", config: { topic: "t" } }] }],
 		[
-			"an unsupported output transport",
-			{ sender: "a", inputs: [buildInput], outputs: [{ ...peerOutput, transport: "nats" }] },
+			"a subscription without a stream",
+			{ subscribe: [{ name: "x", transport: "redis-streams", config: { group: "g" } }] },
 		],
+		["an unknown setting in config", { subscribe: [{ ...inbox, config: { ...inbox.config, strem: "typo" } }] }],
+		["an unknown top-level key", { subscribe: [{ ...inbox, stram: "typo" }] }],
+		["an empty description", { subscribe: [{ ...inbox, description: "" }] }],
+		["a non-boolean enabled", { subscribe: [{ ...inbox, enabled: "yes" }] }],
+		["a non-object config", { subscribe: [{ ...inbox, config: "stream" }] }],
+		["a non-object options", { subscribe: [{ ...inbox, options: 7 }] }],
+		["an invalid activation", { subscribe: [{ ...inbox, activation: "soon" }] }],
 		[
-			"an output without a stream",
-			{ sender: "a", inputs: [buildInput], outputs: [{ name: "to-b", transport: "redis-streams" }] },
+			"activation on a publish channel",
+			{ sender: "agent-a", subscribe: [inbox], publish: [{ ...toB, activation: "immediate" }] },
 		],
+		["publish without a sender", { subscribe: [inbox], publish: [toB] }],
+		["an empty publish array", { sender: "agent-a", subscribe: [inbox], publish: [] }],
+		[
+			"a publish channel without a stream",
+			{ sender: "agent-a", subscribe: [inbox], publish: [{ name: "o", transport: "redis-streams", config: {} }] },
+		],
+		["a sender with a space", { sender: "agent a", subscribe: [inbox], publish: [toB] }],
+		["a sender with a newline", { sender: "agent\na", subscribe: [inbox], publish: [toB] }],
+		["an over-long sender", { sender: "a".repeat(129), subscribe: [inbox], publish: [toB] }],
+		["a duplicated subscribe name", { subscribe: [inbox, inbox] }],
+		["a duplicated publish name", { sender: "agent-a", subscribe: [inbox], publish: [toB, toB] }],
 	])("rejects %s", (_name, document) => {
 		expect(() => parseAceConfig(document, ".ace.json")).toThrow(AceConfigError);
+	});
+
+	it("accepts a sender without publish channels", () => {
+		expect(parseAceConfig({ sender: "agent-a", subscribe: [inbox] }, ".ace.json").sender).toBe("agent-a");
 	});
 
 	it("names the file in the error", () => {
@@ -83,24 +113,59 @@ describe("parseAceConfig", () => {
 	});
 });
 
+describe("channelWarnings", () => {
+	it("warns when two subscriptions split a stream inside one group", () => {
+		const warnings = channelWarnings({
+			subscribe: [
+				{ ...inbox, name: "a" },
+				{ ...inbox, name: "b" },
+			],
+		});
+
+		expect(warnings[0]).toMatch(/same group/);
+	});
+
+	it("warns when two subscriptions deliver every event twice to one agent", () => {
+		const warnings = channelWarnings({
+			subscribe: [
+				{ ...inbox, name: "a" },
+				{ ...inbox, name: "b", config: { stream: "ace:in.a", group: "other" } },
+			],
+		});
+
+		expect(warnings[0]).toMatch(/every event twice/);
+	});
+
+	it("stays quiet for distinct channels", () => {
+		expect(
+			channelWarnings({ subscribe: [inbox, { ...inbox, name: "b", config: { stream: "ace:in.b", group: "g" } }] }),
+		).toEqual([]);
+	});
+});
+
 describe("loadAceConfig", () => {
 	it("reads .ace.json from the working directory", () => {
 		const cwd = temporaryDirectory();
-		writeConfig(cwd, { inputs: [buildInput] });
+		writeConfig(cwd, { subscribe: [inbox] });
 
 		const loaded = loadAceConfig({ cwd });
 
 		expect(loaded?.source).toBe(join(cwd, ACE_CONFIG_FILENAME));
-		expect(loaded?.config.inputs).toEqual([buildInput]);
+		expect(loaded?.config.subscribe).toEqual([{ ...inbox }]);
 	});
 
 	it("prefers ACE_CONFIG over the working directory", () => {
 		const cwd = temporaryDirectory();
 		const elsewhere = join(temporaryDirectory(), "custom.json");
-		writeConfig(cwd, { inputs: [buildInput] });
-		writeFileSync(elsewhere, JSON.stringify({ inputs: [{ ...buildInput, stream: "ace:custom" }] }));
+		writeConfig(cwd, { subscribe: [inbox] });
+		writeFileSync(
+			elsewhere,
+			JSON.stringify({ subscribe: [{ ...inbox, config: { stream: "ace:custom", group: "g" } }] }),
+		);
 
-		expect(loadAceConfig({ cwd, env: { ACE_CONFIG: elsewhere } })?.config.inputs[0]?.stream).toBe("ace:custom");
+		expect(loadAceConfig({ cwd, env: { ACE_CONFIG: elsewhere } })?.config.subscribe[0]?.config.stream).toBe(
+			"ace:custom",
+		);
 	});
 
 	it("returns undefined without a config file", () => {
@@ -116,23 +181,39 @@ describe("loadAceConfig", () => {
 });
 
 describe("resolveAceConfig", () => {
-	it("resolves inputs, outputs and the sender from the file", () => {
+	it("resolves channels, sender and warnings from the file", () => {
 		const cwd = temporaryDirectory();
-		const source = writeConfig(cwd, { sender: "agent-a", inputs: [buildInput], outputs: [peerOutput] });
+		const source = writeConfig(cwd, { sender: "agent-a", subscribe: [inbox], publish: [toB] });
 
 		const resolved = resolveAceConfig({ cwd, env: {} });
 
-		expect(resolved).toMatchObject({ source, sender: "agent-a", inputs: [buildInput], outputs: [peerOutput] });
+		expect(resolved).toMatchObject({ source, sender: "agent-a" });
+		expect(resolved.subscribe[0]?.name).toBe("inbox");
+		expect(resolved.publish[0]?.name).toBe("to-b");
+		expect(resolved.disabled).toEqual([]);
+		expect(resolved.warnings).toEqual([]);
 	});
 
-	it("defaults the sender to a per-process identity", () => {
+	it("filters disabled channels out and reports them", () => {
 		const cwd = temporaryDirectory();
-		writeConfig(cwd, { inputs: [buildInput] });
+		writeConfig(cwd, {
+			sender: "agent-a",
+			subscribe: [inbox, { ...inbox, name: "paused", enabled: false, config: { stream: "ace:paused", group: "g" } }],
+			publish: [{ ...toB, enabled: false }],
+		});
 
 		const resolved = resolveAceConfig({ cwd, env: {} });
 
-		expect(resolved.sender).toMatch(/^pi-\d+$/);
-		expect(resolved.outputs).toEqual([]);
+		expect(resolved.subscribe.map((endpoint) => endpoint.name)).toEqual(["inbox"]);
+		expect(resolved.publish).toEqual([]);
+		expect(resolved.disabled.sort()).toEqual(["paused", "to-b"]);
+	});
+
+	it("leaves sender undefined when nothing is published", () => {
+		const cwd = temporaryDirectory();
+		writeConfig(cwd, { subscribe: [inbox] });
+
+		expect(resolveAceConfig({ cwd, env: {} }).sender).toBeUndefined();
 	});
 
 	it("requires the configuration file: MQ settings never come from the environment", () => {
@@ -145,25 +226,22 @@ describe("resolveAceConfig", () => {
 });
 
 describe("createTransports / createPublishers", () => {
-	it("keys one transport per input name", () => {
+	it("keys one transport per subscription name", () => {
 		const transports = createTransports(
 			[
-				{ ...buildInput, name: "builds" },
-				{ ...buildInput, name: "alerts", stream: "ace:alerts" },
+				{ ...inbox },
+				{ name: "alerts", transport: "redis-streams", config: { stream: "ace:alerts", group: "g" }, options: {} },
 			],
 			{ onError: () => {} },
 		);
 
-		expect(Object.keys(transports).sort()).toEqual(["alerts", "builds"]);
-		expect(transports.builds).not.toBe(transports.alerts);
+		expect(Object.keys(transports).sort()).toEqual(["alerts", "inbox"]);
+		expect(transports.inbox).not.toBe(transports.alerts);
 	});
 
-	it("keys one publisher per output name", () => {
+	it("keys one publisher per publication name", () => {
 		const publishers = createPublishers(
-			[
-				{ ...peerOutput, name: "to-b" },
-				{ ...peerOutput, name: "to-c", stream: "ace:to-c" },
-			],
+			[{ ...toB }, { name: "to-c", transport: "redis-streams", config: { stream: "ace:in.c" }, options: {} }],
 			{ onError: () => {} },
 		);
 
@@ -171,15 +249,19 @@ describe("createTransports / createPublishers", () => {
 		expect(publishers["to-b"]).not.toBe(publishers["to-c"]);
 	});
 
-	it("rejects an unsupported input transport kind", () => {
+	it("rejects an unsupported subscription transport kind", () => {
 		expect(() =>
-			createTransports([{ name: "alerts", transport: "kafka", topic: "ace" }], { onError: () => {} }),
+			createTransports([{ name: "alerts", transport: "kafka", config: { topic: "ace" }, options: {} }], {
+				onError: () => {},
+			}),
 		).toThrow(/unsupported transport "kafka"/);
 	});
 
-	it("rejects an unsupported output transport kind", () => {
+	it("rejects an unsupported publication transport kind", () => {
 		expect(() =>
-			createPublishers([{ name: "to-b", transport: "nats", subject: "ace" }], { onError: () => {} }),
+			createPublishers([{ name: "to-b", transport: "nats", config: { subject: "ace" }, options: {} }], {
+				onError: () => {},
+			}),
 		).toThrow(/unsupported transport "nats"/);
 	});
 });

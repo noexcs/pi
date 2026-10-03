@@ -4,19 +4,19 @@ import type { ConcreteActivation } from "../protocol/ace-message.ts";
 import { AceValidationError, decodeAceMessage } from "../protocol/validator.ts";
 import type { Transport } from "../transport/transport.ts";
 import { DEFAULT_RUNTIME_ACTIVATION, resolveActivation } from "./activation-resolver.ts";
+import { AceConfigError, type EndpointConfig, validateEndpointConfig } from "./endpoint-config.ts";
 import { type DispatchResult, EventDispatcher } from "./event-dispatcher.ts";
-import { AceConfigError, type InputConfig, validateInputConfig } from "./input-config.ts";
 import { type PendingAceEvent, PendingEventStore } from "./pending-event-store.ts";
 
 export interface AceRuntimeOptions {
 	/** Agent engine that receives ACE events (RFC-facing §15). */
 	engine: AgentEngine;
-	/** Where messages come from and which activation the receiver forces (RFC §4.1, §8). */
-	inputs: readonly InputConfig[];
+	/** Channels this runtime receives events from, and the activation it forces per channel (RFC §4.1, §8). */
+	subscribe: readonly EndpointConfig[];
 	/**
-	 * Transport instances keyed by **input name**: each configured input reads from its own
-	 * transport, so two inputs may use the same transport kind (RFC §4.1) with different
-	 * settings — two Redis streams, for example.
+	 * Transport instances keyed by **subscription name**: each configured subscription reads from
+	 * its own transport, so two subscriptions may use the same transport kind (RFC §4.1) with
+	 * different settings — two Redis streams, for example.
 	 */
 	transports: Readonly<Record<string, Transport>>;
 	/** Fallback activation; ACE 0.1 requires `next_turn` when unset (RFC §8). */
@@ -26,7 +26,7 @@ export interface AceRuntimeOptions {
 
 /** Result of handling one raw inbound message. */
 export interface AceHandleResult extends DispatchResult {
-	readonly inputName: string;
+	readonly subscriptionName: string;
 }
 
 /**
@@ -38,8 +38,8 @@ export interface AceHandleResult extends DispatchResult {
  */
 export class AceRuntime {
 	private readonly engine: AgentEngine;
-	private readonly inputs: readonly InputConfig[];
-	private readonly transportByInput: ReadonlyMap<string, Transport>;
+	private readonly subscribe: readonly EndpointConfig[];
+	private readonly transportByName: ReadonlyMap<string, Transport>;
 	private readonly defaultActivation: ConcreteActivation;
 	private readonly logger: AceLogger;
 	private readonly pendingEventStore = new PendingEventStore();
@@ -47,45 +47,45 @@ export class AceRuntime {
 	private started = false;
 
 	constructor(options: AceRuntimeOptions) {
-		this.inputs = options.inputs.map(validateInputConfig);
+		this.subscribe = options.subscribe.map((endpoint) => validateEndpointConfig(endpoint, "subscribe"));
 
-		const transportByInput = new Map<string, Transport>();
+		const transportByName = new Map<string, Transport>();
 		const usedTransports = new Set<Transport>();
-		for (const input of this.inputs) {
-			if (transportByInput.has(input.name)) {
-				throw new AceConfigError(`input name "${input.name}" is configured twice`);
+		for (const subscription of this.subscribe) {
+			if (transportByName.has(subscription.name)) {
+				throw new AceConfigError(`subscribe name "${subscription.name}" is configured twice`);
 			}
-			const transport = options.transports[input.name];
+			const transport = options.transports[subscription.name];
 			if (!transport) {
 				throw new AceConfigError(
-					`input "${input.name}" has no transport registered under its name (registered: ${
+					`subscribe "${subscription.name}" has no transport registered under its name (registered: ${
 						Object.keys(options.transports).join(", ") || "none"
 					})`,
 				);
 			}
 			if (usedTransports.has(transport)) {
 				throw new AceConfigError(
-					`transport of input "${input.name}" is already used by another input; its messages would be delivered twice`,
+					`transport of subscribe "${subscription.name}" is already used by another subscription; its messages would be delivered twice`,
 				);
 			}
 			usedTransports.add(transport);
-			transportByInput.set(input.name, transport);
+			transportByName.set(subscription.name, transport);
 		}
 
 		this.engine = options.engine;
-		this.transportByInput = transportByInput;
+		this.transportByName = transportByName;
 		this.defaultActivation = options.defaultActivation ?? DEFAULT_RUNTIME_ACTIVATION;
 		this.logger = options.logger ?? {};
 		this.dispatcher = new EventDispatcher(this.engine, this.pendingEventStore, this.logger);
 	}
 
-	/** Connect every input's transport (RFC §33). */
+	/** Connect every subscription's transport (RFC §33). */
 	async start(): Promise<void> {
 		if (this.started) throw new AceConfigError("ACE runtime is already started");
 		this.started = true;
 		try {
-			for (const input of this.inputs) {
-				await this.transportFor(input).start((raw) => this.deliver(raw, input));
+			for (const subscription of this.subscribe) {
+				await this.transportFor(subscription).start((raw) => this.deliver(raw, subscription));
 			}
 		} catch (error) {
 			// Do not claim to be started when a transport refused to connect.
@@ -93,7 +93,7 @@ export class AceRuntime {
 			throw error;
 		}
 		this.logger.info?.(
-			`[ACE] runtime started inputs=${this.inputs.map((input) => input.name).join(",")} defaultActivation=${this.defaultActivation}`,
+			`[ACE] runtime started subscribe=${this.subscribe.map((endpoint) => endpoint.name).join(",")} defaultActivation=${this.defaultActivation}`,
 		);
 	}
 
@@ -101,8 +101,8 @@ export class AceRuntime {
 	async stop(): Promise<void> {
 		if (!this.started) return;
 		this.started = false;
-		for (const input of this.inputs) {
-			await this.transportFor(input).stop();
+		for (const subscription of this.subscribe) {
+			await this.transportFor(subscription).stop();
 		}
 		await this.engine.waitForIdle();
 		this.logger.info?.("[ACE] runtime stopped");
@@ -116,19 +116,19 @@ export class AceRuntime {
 	 * lets other errors propagate so the transport can retry or dead-letter
 	 * (design doc §30).
 	 */
-	async handleRawMessage(raw: unknown, input: InputConfig): Promise<AceHandleResult> {
+	async handleRawMessage(raw: unknown, subscription: EndpointConfig): Promise<AceHandleResult> {
 		const message = decodeAceMessage(raw);
-		const activation = resolveActivation(message, input, this.defaultActivation);
-		this.logger.info?.(`[ACE] received id=${message.id} sender=${message.sender} input=${input.name}`);
-		const result = await this.dispatcher.dispatch(message, input.name, activation);
-		return { ...result, inputName: input.name };
+		const activation = resolveActivation(message, subscription, this.defaultActivation);
+		this.logger.info?.(`[ACE] received id=${message.id} sender=${message.sender} subscribe=${subscription.name}`);
+		const result = await this.dispatcher.dispatch(message, subscription.name, activation);
+		return { ...result, subscriptionName: subscription.name };
 	}
 
-	/** Handle a raw message addressed to a configured input by name. */
-	async handleMessage(raw: unknown, inputName: string): Promise<AceHandleResult> {
-		const input = this.inputs.find((candidate) => candidate.name === inputName);
-		if (!input) throw new AceConfigError(`unknown input "${inputName}"`);
-		return this.handleRawMessage(raw, input);
+	/** Handle a raw message addressed to a configured subscription by name. */
+	async handleMessage(raw: unknown, subscriptionName: string): Promise<AceHandleResult> {
+		const subscription = this.subscribe.find((candidate) => candidate.name === subscriptionName);
+		if (!subscription) throw new AceConfigError(`unknown subscription "${subscriptionName}"`);
+		return this.handleRawMessage(raw, subscription);
 	}
 
 	/** Events retained for `manual` activation (RFC §7.3, §12). */
@@ -147,23 +147,23 @@ export class AceRuntime {
 		if (!event) {
 			throw new Error(`No pending ACE event for sender="${sender}" id="${id}"`);
 		}
-		this.logger.info?.(`[ACE] activating id=${id} sender=${sender} input=${event.inputName}`);
+		this.logger.info?.(`[ACE] activating id=${id} sender=${sender} subscribe=${event.subscriptionName}`);
 		await this.engine.inject(event.message, "next_turn");
 	}
 
-	private transportFor(input: InputConfig): Transport {
-		const transport = this.transportByInput.get(input.name);
-		if (!transport) throw new AceConfigError(`input "${input.name}" has no transport`);
+	private transportFor(subscription: EndpointConfig): Transport {
+		const transport = this.transportByName.get(subscription.name);
+		if (!transport) throw new AceConfigError(`subscribe "${subscription.name}" has no transport`);
 		return transport;
 	}
 
-	private async deliver(raw: unknown, input: InputConfig): Promise<void> {
+	private async deliver(raw: unknown, subscription: EndpointConfig): Promise<void> {
 		try {
-			await this.handleRawMessage(raw, input);
+			await this.handleRawMessage(raw, subscription);
 		} catch (error) {
 			if (error instanceof AceValidationError) {
 				const fields = error.issues.map((issue) => issue.path || "<message>").join(",");
-				this.logger.warn?.(`[ACE] rejected input=${input.name} fields=${fields}`);
+				this.logger.warn?.(`[ACE] rejected subscribe=${subscription.name} fields=${fields}`);
 				return;
 			}
 			throw error;

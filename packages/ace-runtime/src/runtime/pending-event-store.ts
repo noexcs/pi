@@ -3,7 +3,7 @@ import type { AceMessage } from "../protocol/ace-message.ts";
 /** A `manual` ACE event retained by the runtime until it is activated (RFC §7.3). */
 export interface PendingAceEvent {
 	readonly message: AceMessage;
-	readonly inputName: string;
+	readonly subscriptionName: string;
 }
 
 /**
@@ -21,8 +21,8 @@ export class PendingEventStore {
 		return [...this.events];
 	}
 
-	store(message: AceMessage, inputName: string): PendingAceEvent {
-		const event: PendingAceEvent = { message, inputName };
+	store(message: AceMessage, subscriptionName: string): PendingAceEvent {
+		const event: PendingAceEvent = { message, subscriptionName };
 		this.events.push(event);
 		return event;
 	}

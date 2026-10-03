@@ -23,6 +23,12 @@ export class AceValidationError extends Error {
 
 const utf8 = new TextDecoder();
 
+/** Longest accepted `sessionId`; the value is opaque but gets rendered into agent context. */
+const MAX_SESSION_ID_LENGTH = 128;
+
+/** Control characters would let a session id forge lines in the rendered event header. */
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+
 /**
  * Validate a decoded ACE 0.1 message (RFC §12, §13).
  *
@@ -35,7 +41,7 @@ export function validateAceMessage(value: unknown): AceMessage {
 	}
 
 	const issues: AceValidationIssue[] = [];
-	const { aceVersion, id, sender, activation, body } = value;
+	const { aceVersion, id, sender, sessionId, activation, body } = value;
 
 	if (aceVersion !== ACE_VERSION) {
 		issues.push({
@@ -48,6 +54,16 @@ export function validateAceMessage(value: unknown): AceMessage {
 	}
 	if (typeof sender !== "string" || sender.length === 0) {
 		issues.push({ path: "sender", message: `must be a non-empty string, received ${describeValue(sender)}` });
+	}
+	if (sessionId !== undefined) {
+		if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > MAX_SESSION_ID_LENGTH) {
+			issues.push({
+				path: "sessionId",
+				message: `must be a string of 1..${MAX_SESSION_ID_LENGTH} characters or absent, received ${describeValue(sessionId)}`,
+			});
+		} else if (CONTROL_CHARACTERS.test(sessionId)) {
+			issues.push({ path: "sessionId", message: "must not contain control characters" });
+		}
 	}
 	if (!isActivation(activation)) {
 		issues.push({
@@ -66,6 +82,7 @@ export function validateAceMessage(value: unknown): AceMessage {
 		aceVersion: ACE_VERSION as AceVersion,
 		id: id as string,
 		sender: sender as string,
+		...(sessionId === undefined ? {} : { sessionId: sessionId as string }),
 		activation: activation as Activation,
 		body: body as string,
 	};

@@ -3,7 +3,7 @@ import type { AceLogger } from "../../src/logger.ts";
 import type { AceMessage } from "../../src/protocol/ace-message.ts";
 import { AceValidationError } from "../../src/protocol/validator.ts";
 import { AceRuntime } from "../../src/runtime/ace-runtime.ts";
-import { AceConfigError, type InputConfig } from "../../src/runtime/input-config.ts";
+import { AceConfigError, type EndpointConfig } from "../../src/runtime/endpoint-config.ts";
 import { InMemoryTransport } from "../../src/transport/in-memory-transport.ts";
 import { FakeAgentEngine } from "../support/fake-agent-engine.ts";
 
@@ -25,14 +25,20 @@ function collectLogs(): AceLogger & { lines: string[] } {
 	};
 }
 
-function setup(inputOverrides: Partial<InputConfig> = {}, defaultActivation?: "immediate" | "next_turn" | "manual") {
+function setup(inputOverrides: Partial<EndpointConfig> = {}, defaultActivation?: "immediate" | "next_turn" | "manual") {
 	const transport = new InMemoryTransport();
 	const engine = new FakeAgentEngine();
-	const input: InputConfig = { name: "build-events", transport: "memory", ...inputOverrides };
+	const input: EndpointConfig = {
+		name: "build-events",
+		transport: "memory",
+		config: {},
+		options: {},
+		...inputOverrides,
+	};
 	const logger = collectLogs();
 	const runtime = new AceRuntime({
 		engine,
-		inputs: [input],
+		subscribe: [input],
 		transports: { [input.name]: transport },
 		logger,
 		defaultActivation,
@@ -56,9 +62,18 @@ describe("AceRuntime dispatch (RFC §7, §9, §19)", () => {
 		await runtime.start();
 		engine.running = true;
 
-		const result = await runtime.handleRawMessage(validRaw, { name: "build-events", transport: "memory" });
+		const result = await runtime.handleRawMessage(validRaw, {
+			name: "build-events",
+			transport: "memory",
+			config: {},
+			options: {},
+		});
 
-		expect(result).toMatchObject({ activation: "next_turn", disposition: "queued", inputName: "build-events" });
+		expect(result).toMatchObject({
+			activation: "next_turn",
+			disposition: "queued",
+			subscriptionName: "build-events",
+		});
 		expect(engine.injections[0]?.mode).toBe("next_turn");
 	});
 
@@ -215,7 +230,7 @@ describe("AceRuntime lifecycle and configuration", () => {
 			() =>
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
-					inputs: [{ name: "alerts", transport: "redis-streams" }],
+					subscribe: [{ name: "alerts", transport: "redis-streams", config: {}, options: {} }],
 					transports: {},
 				}),
 		).toThrow(/no transport registered under its name/);
@@ -227,9 +242,9 @@ describe("AceRuntime lifecycle and configuration", () => {
 			() =>
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
-					inputs: [
-						{ name: "builds", transport: "memory" },
-						{ name: "alerts", transport: "memory" },
+					subscribe: [
+						{ name: "builds", transport: "memory", config: {}, options: {} },
+						{ name: "alerts", transport: "memory", config: {}, options: {} },
 					],
 					transports: { builds: shared, alerts: shared },
 				}),
@@ -241,9 +256,9 @@ describe("AceRuntime lifecycle and configuration", () => {
 			() =>
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
-					inputs: [
-						{ name: "builds", transport: "memory" },
-						{ name: "builds", transport: "memory" },
+					subscribe: [
+						{ name: "builds", transport: "memory", config: {}, options: {} },
+						{ name: "builds", transport: "memory", config: {}, options: {} },
 					],
 					transports: { builds: new InMemoryTransport() },
 				}),
@@ -256,9 +271,9 @@ describe("AceRuntime lifecycle and configuration", () => {
 		const alerts = new InMemoryTransport();
 		const runtime = new AceRuntime({
 			engine,
-			inputs: [
-				{ name: "builds", transport: "redis-streams", stream: "ace:builds" },
-				{ name: "alerts", transport: "redis-streams", stream: "ace:alerts" },
+			subscribe: [
+				{ name: "builds", transport: "redis-streams", config: { stream: "ace:builds" }, options: {} },
+				{ name: "alerts", transport: "redis-streams", config: { stream: "ace:alerts" }, options: {} },
 			],
 			transports: { builds, alerts },
 		});
@@ -275,10 +290,13 @@ describe("AceRuntime lifecycle and configuration", () => {
 	});
 
 	// Deliberately malformed configurations: the runtime rejects them at construction.
-	const invalidInputs: Array<[string, InputConfig]> = [
-		["a missing name", { transport: "memory" } as unknown as InputConfig],
-		["an empty transport", { name: "builds", transport: "" }],
-		["an invalid activation", { name: "builds", transport: "memory", activation: "soon" } as unknown as InputConfig],
+	const invalidInputs: Array<[string, EndpointConfig]> = [
+		["a missing name", { transport: "memory" } as unknown as EndpointConfig],
+		["an empty transport", { name: "builds", transport: "", config: {}, options: {} } as unknown as EndpointConfig],
+		[
+			"an invalid activation",
+			{ name: "builds", transport: "memory", activation: "soon" } as unknown as EndpointConfig,
+		],
 	];
 
 	it.each(invalidInputs)("rejects an input config with %s", (_name, config) => {
@@ -286,7 +304,7 @@ describe("AceRuntime lifecycle and configuration", () => {
 			() =>
 				new AceRuntime({
 					engine: new FakeAgentEngine(),
-					inputs: [config],
+					subscribe: [config],
 					transports: { [String(config.name ?? "builds")]: new InMemoryTransport() },
 				}),
 		).toThrow(AceConfigError);
@@ -294,7 +312,7 @@ describe("AceRuntime lifecycle and configuration", () => {
 
 	it("rejects an unknown input name when handling by name", async () => {
 		const { runtime } = setup();
-		await expect(runtime.handleMessage(validRaw, "nope")).rejects.toThrow(/unknown input "nope"/);
+		await expect(runtime.handleMessage(validRaw, "nope")).rejects.toThrow(/unknown subscription "nope"/);
 	});
 
 	it("keeps unknown ACE fields on the injected message (RFC §15)", async () => {

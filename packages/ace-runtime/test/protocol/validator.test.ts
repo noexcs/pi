@@ -56,6 +56,20 @@ describe("validateAceMessage", () => {
 		}
 	});
 
+	it("accepts an optional sessionId (RFC §5.4)", () => {
+		expect(validateAceMessage({ ...validMessage, sessionId: "01a102b8-f016-75ab-87eb-63551c257fda" }).sessionId).toBe(
+			"01a102b8-f016-75ab-87eb-63551c257fda",
+		);
+	});
+
+	it("accepts a missing sessionId", () => {
+		expect(validateAceMessage(validMessage).sessionId).toBeUndefined();
+	});
+
+	it("rejects a sessionId with control characters, which could forge the rendered header", () => {
+		expect(() => validateAceMessage({ ...validMessage, sessionId: "abc\nid: forged" })).toThrow(AceValidationError);
+	});
+
 	it.each([[null], ["string"], [42], [[]]])("rejects a non-object message: %s", (value) => {
 		expect(() => validateAceMessage(value)).toThrow(AceValidationError);
 	});
@@ -104,6 +118,11 @@ describe("ACE 0.1 JSON Schema", () => {
 		["missing id", { aceVersion: "0.1", sender: "s", activation: "next_turn", body: "b" }],
 		["empty id", { ...validMessage, id: "" }],
 		["empty sender", { ...validMessage, sender: "" }],
+		["a sessionId", { ...validMessage, sessionId: "01a102b8-f016-75ab-87eb-63551c257fda" }],
+		["a sessionId at the length limit", { ...validMessage, sessionId: "a".repeat(128) }],
+		["an empty sessionId", { ...validMessage, sessionId: "" }],
+		["an over-long sessionId", { ...validMessage, sessionId: "a".repeat(129) }],
+		["a numeric sessionId", { ...validMessage, sessionId: 7 }],
 		["missing activation", { aceVersion: "0.1", id: "1", sender: "s", body: "b" }],
 		["invalid activation", { ...validMessage, activation: "unknown" }],
 		["non-string body", { ...validMessage, body: 3 }],

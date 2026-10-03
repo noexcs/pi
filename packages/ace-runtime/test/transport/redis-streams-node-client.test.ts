@@ -20,9 +20,8 @@ describe("RedisStreamsTransport against an unreachable broker", () => {
 			{
 				name: "build-events",
 				transport: "redis-streams",
-				stream: "ace:events",
-				group: "ace-pi",
-				url: `redis://127.0.0.1:${port}`,
+				config: { stream: "ace:events", group: "ace-pi", url: `redis://127.0.0.1:${port}` },
+				options: {},
 			},
 			{ onError: (error) => errors.push(error) },
 		);

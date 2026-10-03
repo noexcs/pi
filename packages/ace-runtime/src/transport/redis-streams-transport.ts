@@ -1,16 +1,17 @@
 import {
 	AceConfigError,
-	type InputConfig,
+	type EndpointConfig,
 	optionalStringField,
 	positiveIntegerField,
+	rejectUnknownKeys,
 	requiredStringField,
-} from "../runtime/input-config.ts";
+} from "../runtime/endpoint-config.ts";
 import type { RedisStreamEntry, RedisStreamsClient } from "./redis-streams-client.ts";
 import { createRedisStreamsClient } from "./redis-streams-node-client.ts";
 import type { RawAceMessageHandler, Transport } from "./transport.ts";
 
 /**
- * Redis Streams settings, read from the input config (RFC §4.1, §9).
+ * Redis Streams settings, read from the subscription config (RFC §4.1, §9).
  *
  * These keys are transport configuration, not ACE protocol fields: they never travel
  * inside an ACE message and never map to ACE fields (RFC §4).
@@ -39,17 +40,30 @@ export const REDIS_STREAMS_DEFAULTS = {
 	blockMs: 1000,
 } as const;
 
-/** Extract and validate the Redis Streams settings of one input config. */
-export function redisStreamsConfigFrom(input: InputConfig): RedisStreamsConfig {
-	const subject = `input "${input.name}"`;
+/** Settings a Redis Streams subscription understands inside its `config` object. */
+export const REDIS_STREAMS_SUBSCRIPTION_KEYS = [
+	"stream",
+	"group",
+	"url",
+	"consumer",
+	"field",
+	"count",
+	"blockMs",
+] as const;
+
+/** Extract and validate the Redis Streams settings of one subscription. */
+export function redisStreamsConfigFrom(subscription: EndpointConfig): RedisStreamsConfig {
+	const subject = `subscribe "${subscription.name}" config`;
+	const config = subscription.config;
+	rejectUnknownKeys(config, REDIS_STREAMS_SUBSCRIPTION_KEYS, subject);
 	return {
-		url: optionalStringField(input, "url", REDIS_STREAMS_DEFAULTS.url, subject),
-		stream: requiredStringField(input, "stream", subject),
-		group: requiredStringField(input, "group", subject),
-		consumer: optionalStringField(input, "consumer", DEFAULT_CONSUMER, subject),
-		field: optionalStringField(input, "field", REDIS_STREAMS_DEFAULTS.field, subject),
-		count: positiveIntegerField(input, "count", REDIS_STREAMS_DEFAULTS.count, subject),
-		blockMs: positiveIntegerField(input, "blockMs", REDIS_STREAMS_DEFAULTS.blockMs, subject),
+		url: optionalStringField(config, "url", REDIS_STREAMS_DEFAULTS.url, subject),
+		stream: requiredStringField(config, "stream", subject),
+		group: requiredStringField(config, "group", subject),
+		consumer: optionalStringField(config, "consumer", DEFAULT_CONSUMER, subject),
+		field: optionalStringField(config, "field", REDIS_STREAMS_DEFAULTS.field, subject),
+		count: positiveIntegerField(config, "count", REDIS_STREAMS_DEFAULTS.count, subject),
+		blockMs: positiveIntegerField(config, "blockMs", REDIS_STREAMS_DEFAULTS.blockMs, subject),
 	};
 }
 
@@ -82,11 +96,17 @@ export class RedisStreamsTransport implements Transport {
 	private loop?: Promise<void>;
 	private stopped = true;
 
-	constructor(input: InputConfig, options: RedisStreamsTransportOptions = {}) {
-		this.config = redisStreamsConfigFrom(input);
+	constructor(subscription: EndpointConfig, options: RedisStreamsTransportOptions = {}) {
+		this.config = redisStreamsConfigFrom(subscription);
 		this.onError = options.onError ?? (() => {});
 		this.client =
-			options.client ?? createRedisStreamsClient(this.config.url, this.config.field, (error) => this.report(error));
+			options.client ??
+			createRedisStreamsClient(
+				this.config.url,
+				this.config.field,
+				(error) => this.report(error),
+				subscription.options,
+			);
 	}
 
 	/** Connect, create the consumer group if needed, then consume in the background. */

@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { AceRuntime } from "../../src/runtime/ace-runtime.ts";
-import { AceConfigError, type InputConfig } from "../../src/runtime/input-config.ts";
+import { AceConfigError, type EndpointConfig } from "../../src/runtime/endpoint-config.ts";
 import { RedisStreamsTransport, redisStreamsConfigFrom } from "../../src/transport/redis-streams-transport.ts";
 import { FakeAgentEngine } from "../support/fake-agent-engine.ts";
 import { FakeRedisStreamsClient } from "../support/fake-redis-client.ts";
 
-const redisInput: InputConfig = {
+const redisInput: EndpointConfig = {
 	name: "build-events",
 	transport: "redis-streams",
-	stream: "ace:build-events",
-	group: "coding-agent",
+	config: { stream: "ace:build-events", group: "coding-agent" },
+	options: {},
 };
 
 const validEntry = JSON.stringify({
@@ -20,8 +20,8 @@ const validEntry = JSON.stringify({
 	body: "Build failed for project foo.",
 });
 
-function setup(overrides: Partial<InputConfig> = {}) {
-	const input: InputConfig = { ...redisInput, ...overrides };
+function setup(configOverrides: Record<string, unknown> = {}) {
+	const input: EndpointConfig = { ...redisInput, config: { ...redisInput.config, ...configOverrides } };
 	const client = new FakeRedisStreamsClient();
 	const errors: unknown[] = [];
 	const transport = new RedisStreamsTransport(input, { client, onError: (error) => errors.push(error) });
@@ -46,13 +46,16 @@ describe("redisStreamsConfigFrom", () => {
 			redisStreamsConfigFrom({
 				name: "builds",
 				transport: "redis-streams",
-				stream: "ace:builds",
-				group: "agents",
-				url: "redis://broker:6380",
-				consumer: "worker-1",
-				field: "ace",
-				count: 4,
-				blockMs: 250,
+				config: {
+					stream: "ace:builds",
+					group: "agents",
+					url: "redis://broker:6380",
+					consumer: "worker-1",
+					field: "ace",
+					count: 4,
+					blockMs: 250,
+				},
+				options: {},
 			}),
 		).toEqual({
 			url: "redis://broker:6380",
@@ -75,16 +78,20 @@ describe("redisStreamsConfigFrom", () => {
 		expect(config.consumer).toMatch(/^ace-\d+$/);
 	});
 
-	it.each([
-		["missing stream", { name: "builds", transport: "redis-streams", group: "agents" }],
-		["empty group", { name: "builds", transport: "redis-streams", stream: "s", group: "" }],
-		["zero count", { name: "builds", transport: "redis-streams", stream: "s", group: "g", count: 0 }],
-		["fractional count", { name: "builds", transport: "redis-streams", stream: "s", group: "g", count: 1.5 }],
-		["string count", { name: "builds", transport: "redis-streams", stream: "s", group: "g", count: "8" }],
-		["zero blockMs", { name: "builds", transport: "redis-streams", stream: "s", group: "g", blockMs: 0 }],
-		["empty field", { name: "builds", transport: "redis-streams", stream: "s", group: "g", field: "" }],
-	])("rejects %s", (_name, input) => {
-		expect(() => redisStreamsConfigFrom(input as InputConfig)).toThrow(AceConfigError);
+	const invalidConfigs: Array<[string, Record<string, unknown>]> = [
+		["missing stream", { group: "agents" }],
+		["empty group", { stream: "s", group: "" }],
+		["zero count", { stream: "s", group: "g", count: 0 }],
+		["fractional count", { stream: "s", group: "g", count: 1.5 }],
+		["string count", { stream: "s", group: "g", count: "8" }],
+		["zero blockMs", { stream: "s", group: "g", blockMs: 0 }],
+		["empty field", { stream: "s", group: "g", field: "" }],
+		["an unknown setting", { stream: "s", group: "g", strem: "typo" }],
+	];
+
+	it.each(invalidConfigs)("rejects a config with %s", (_name, config) => {
+		const endpoint: EndpointConfig = { name: "builds", transport: "redis-streams", config, options: {} };
+		expect(() => redisStreamsConfigFrom(endpoint)).toThrow(AceConfigError);
 	});
 });
 
@@ -216,7 +223,7 @@ describe("RedisStreamsTransport with the ACE runtime", () => {
 		const engine = new FakeAgentEngine();
 		const runtime = new AceRuntime({
 			engine,
-			inputs: [redisInput],
+			subscribe: [redisInput],
 			transports: { [redisInput.name]: transport },
 		});
 
@@ -235,7 +242,7 @@ describe("RedisStreamsTransport with the ACE runtime", () => {
 		const logged: string[] = [];
 		const runtime = new AceRuntime({
 			engine,
-			inputs: [redisInput],
+			subscribe: [redisInput],
 			transports: { [redisInput.name]: transport },
 			logger: { warn: (message) => logged.push(message) },
 		});

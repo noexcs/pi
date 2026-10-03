@@ -1,4 +1,4 @@
-import { createClient } from "redis";
+import { createClient, type RedisClientOptions } from "redis";
 import type { RedisStreamsClient } from "./redis-streams-client.ts";
 
 /** Give up after this many failed attempts instead of retrying a dead broker forever. */
@@ -30,10 +30,18 @@ export function createRedisStreamsClient(
 	url: string,
 	field: string,
 	onError: (error: unknown) => void,
+	clientOptions: Record<string, unknown> = {},
 ): RedisStreamsClient {
+	// Operator-supplied passthrough (`.ace.json` `options`): the Redis client owns its own schema,
+	// so this is the one place where configuration is handed over unchecked.
+	const operatorOptions = clientOptions as RedisClientOptions;
+	const operatorSocket = typeof operatorOptions.socket === "object" ? operatorOptions.socket : {};
 	const client = createClient({
+		...operatorOptions,
 		url,
 		socket: {
+			...operatorSocket,
+			// This transport always bounds reconnection so an unreachable broker fails the start.
 			reconnectStrategy: (retries) =>
 				retries > MAX_RECONNECT_ATTEMPTS ? new Error(`${url} is unreachable`) : retries * RECONNECT_DELAY_MS,
 		},

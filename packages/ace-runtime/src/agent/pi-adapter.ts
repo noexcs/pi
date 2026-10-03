@@ -3,6 +3,9 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AceMessage } from "../protocol/ace-message.ts";
 import type { AgentEngine, InjectionMode } from "./agent-engine.ts";
 
+/** Characters kept when a session id is displayed (see {@link formatSessionLabel}). */
+const SESSION_LABEL_LENGTH = 6;
+
 export interface PiAdapterOptions {
 	/** Pi session that owns the agent context, turns, tools, and LLM calls. */
 	session: AgentSession;
@@ -16,12 +19,25 @@ export interface PiAdapterOptions {
  * Default rendering of an ACE event for the Pi context (design doc §18).
  *
  * This header is an adapter choice, not an ACE protocol requirement; the
- * protocol only requires `body` to become visible to later reasoning (RFC §9).
+ * protocol only requires `body` to become visible to later reasoning (RFC §9). A message that
+ * carries `sessionId` shows its short label so the agent can tell conversations apart.
  * Because the rendered text starts with a fixed prefix, an ACE body can never
  * be mistaken for a Pi slash command or prompt template.
  */
 export function renderAceEvent(message: AceMessage): string {
-	return ["[ACE Event]", `sender: ${message.sender}`, `id: ${message.id}`, "", message.body].join("\n");
+	const session = message.sessionId === undefined ? "" : ` (session ${formatSessionLabel(message.sessionId)})`;
+	return ["[ACE Event]", `sender: ${message.sender}${session}`, `id: ${message.id}`, "", message.body].join("\n");
+}
+
+/**
+ * Short label for a session id, for logs, the status line, and rendered events.
+ *
+ * The tail is what distinguishes concurrent sessions: uuidv7 and friends spend their leading
+ * characters on a timestamp, so two sessions started seconds apart share a long prefix. Truncation
+ * happens here only — the protocol field keeps the full value, and the label is never an identifier.
+ */
+export function formatSessionLabel(sessionId: string): string {
+	return sessionId.length <= SESSION_LABEL_LENGTH ? sessionId : sessionId.slice(-SESSION_LABEL_LENGTH);
 }
 
 /** One ACE event handed to Pi, tracked until Pi shows it to the model. */
