@@ -1,6 +1,10 @@
 import { createClient } from "redis";
 import type { RedisStreamsClient } from "./redis-streams-client.ts";
 
+/** Give up after this many failed attempts instead of retrying a dead broker forever. */
+const MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_DELAY_MS = 150;
+
 function isGroupAlreadyExistsError(error: unknown): boolean {
 	return error instanceof Error && error.message.includes("BUSYGROUP");
 }
@@ -11,23 +15,44 @@ function payloadOf(entry: { message: Record<string, string> }, field: string): s
 	return typeof value === "string" ? value : undefined;
 }
 
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Adapt the `redis` package to {@link RedisStreamsClient}.
  *
- * Connection-level failures arrive asynchronously, detached from any command, so they are
- * reported through `onError`.
+ * Connection failures are reported through `onError` at most once per outage — the client would
+ * otherwise emit one error per reconnect attempt — and reconnection is bounded so an unreachable
+ * broker fails the start instead of retrying forever.
  */
 export function createRedisStreamsClient(
 	url: string,
 	field: string,
 	onError: (error: unknown) => void,
 ): RedisStreamsClient {
-	const client = createClient({ url });
-	client.on("error", onError);
+	const client = createClient({
+		url,
+		socket: {
+			reconnectStrategy: (retries) =>
+				retries > MAX_RECONNECT_ATTEMPTS ? new Error(`${url} is unreachable`) : retries * RECONNECT_DELAY_MS,
+		},
+	});
+
+	// The initial connection failure is thrown by `connect()` (and reported once by the host);
+	// afterwards each outage is reported at most once per successful command.
+	let connected = false;
+	let outageReported = false;
+	client.on("error", (error) => {
+		if (!connected || outageReported) return;
+		outageReported = true;
+		onError(new Error(`${url}: ${describeError(error)}`));
+	});
 
 	return {
 		async connect() {
 			await client.connect();
+			connected = true;
 		},
 
 		async ensureGroup(stream, group) {
@@ -35,8 +60,10 @@ export function createRedisStreamsClient(
 				// Start at the tail: ACE consumes events from now on; replay stays an
 				// infrastructure capability we do not use yet (RFC §17).
 				await client.xGroupCreate(stream, group, "$", { MKSTREAM: true });
+				outageReported = false;
 			} catch (error) {
 				if (!isGroupAlreadyExistsError(error)) throw error;
+				outageReported = false;
 			}
 		},
 
@@ -45,6 +72,9 @@ export function createRedisStreamsClient(
 				COUNT: count,
 				BLOCK: blockMs,
 			});
+			// A completed command means the connection is healthy again, so a later outage may be
+			// reported once more.
+			outageReported = false;
 			const messages: Array<{ id: string; message: Record<string, string> }> = reply?.[0]?.messages ?? [];
 			return messages.map((entry) => ({
 				id: entry.id,

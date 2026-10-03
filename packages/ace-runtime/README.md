@@ -283,6 +283,7 @@ Pass `renderEvent` to `PiAdapter` to change the format.
 |---|---|
 | Non-conforming message | rejected; through a transport it is logged and dropped, `handleRawMessage` throws `AceValidationError` |
 | Transport or injection failure | propagated, so the transport can retry or dead-letter (RFC §17, design doc §30) |
+| Unreachable broker | the start fails once with the URL; reconnection is bounded and an outage after the start is reported at most once until commands succeed again |
 | Agent turn failure | reported through `PiAdapter`'s `onRunError`, since Pi records it on the assistant message rather than rejecting `prompt()` |
 
 Log lines carry `id`, `sender`, `input`, and `activation` only — never the body.
@@ -295,6 +296,7 @@ Log lines carry `id`, `sender`, `input`, and `activation` only — never the bod
   dynamic targets, bindings, result events and acknowledgement APIs are out of scope (design doc §27, §37).
 - A Redis entry whose handler failed stays in the group's pending entries list; there is no reclaim worker
   (`XAUTOCLAIM`) yet, and a failed read ends consumption until the transport is recreated.
+- The runtime does not reconnect in the background: start the broker, then restart Pi (or recreate the transport).
 - `AceRuntime` registers transports by input name and rejects a transport instance shared by two inputs, because
   every message would then be dispatched twice. Two inputs may use the same transport kind with different settings.
 - The extension engine's `waitForIdle()` resolves immediately: a session shutdown must not block the interactive UI

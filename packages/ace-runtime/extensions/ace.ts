@@ -128,7 +128,11 @@ export default function aceExtension(pi: ExtensionAPI): void {
 		} catch (error) {
 			runtime = undefined;
 			origin = undefined;
-			report(ctx, `[ace] could not start: ${describeError(error)}`, "error");
+			report(
+				ctx,
+				`[ace] could not start: ${describeError(error)} (check the broker in .ace.json, then restart Pi)`,
+				"error",
+			);
 		}
 	});
 
