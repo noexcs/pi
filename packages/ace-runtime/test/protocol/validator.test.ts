@@ -6,6 +6,7 @@ import {
 	parseAceMessage,
 	validateAceMessage,
 } from "../../src/protocol/validator.ts";
+import { type JsonSchemaNode, schemaErrors } from "../support/json-schema.ts";
 
 const validMessage = {
 	aceVersion: "0.1",
@@ -89,40 +90,9 @@ describe("parseAceMessage / decodeAceMessage", () => {
 
 // The RFC ships a JSON Schema; these tests keep the hand-written validator and the
 // schema document from drifting apart.
-type JsonSchema = {
-	type?: string;
-	required?: string[];
-	const?: unknown;
-	enum?: readonly unknown[];
-	minLength?: number;
-	properties?: Record<string, JsonSchema>;
-	additionalProperties?: boolean;
-};
-
 const schema = JSON.parse(
 	readFileSync(new URL("../../schema/ace-message-0.1.schema.json", import.meta.url), "utf8"),
-) as JsonSchema;
-
-function schemaIssues(value: unknown, node: JsonSchema = schema, path = ""): string[] {
-	if (node.type === "object") {
-		if (typeof value !== "object" || value === null || Array.isArray(value)) {
-			return [`${path}: not an object`];
-		}
-		const record = value as Record<string, unknown>;
-		const issues = (node.required ?? []).filter((key) => !(key in record)).map((key) => `${path}${key}: missing`);
-		for (const [key, child] of Object.entries(node.properties ?? {})) {
-			if (key in record) issues.push(...schemaIssues(record[key], child, `${path}${key}.`));
-		}
-		return issues;
-	}
-	if (node.type === "string") {
-		if (typeof value !== "string") return [`${path}: not a string`];
-		if (node.const !== undefined && value !== node.const) return [`${path}: const mismatch`];
-		if (node.enum && !node.enum.includes(value)) return [`${path}: not in enum`];
-		if (node.minLength !== undefined && value.length < node.minLength) return [`${path}: shorter than minLength`];
-	}
-	return [];
-}
+) as JsonSchemaNode;
 
 describe("ACE 0.1 JSON Schema", () => {
 	it.each([
@@ -140,7 +110,7 @@ describe("ACE 0.1 JSON Schema", () => {
 		["non-object", "not a message"],
 		["array", []],
 	])("agrees with the validator for %s", (_name, value) => {
-		const schemaAccepts = schemaIssues(value).length === 0;
+		const schemaAccepts = schemaErrors(value, schema).length === 0;
 		let validatorAccepts = true;
 		try {
 			validateAceMessage(value);

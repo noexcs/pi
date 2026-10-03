@@ -125,6 +125,17 @@ Load it permanently by copying or symlinking the file into `~/.pi/agent/extensio
 groups. `ACE_CONFIG` selects a different config file path, `ACE_LOG=1` also logs runtime lines in modes without a
 UI.
 
+[`schema/ace-config.schema.json`](schema/ace-config.schema.json) describes the file, so editors validate and
+autocomplete it after adding a `$schema` line:
+
+```json
+{ "$schema": "./node_modules/ace-runtime/schema/ace-config.schema.json", "inputs": [ … ] }
+```
+
+The schema covers structure, types, per-kind required keys, and "outputs need a sender". Two rules are semantic and
+stay in the validator: names must be unique within `inputs` and within `outputs`, and one transport instance cannot
+serve two inputs. `test/runtime/ace-config-schema.test.ts` fails when the schema and the validator disagree.
+
 ### What injection looks like
 
 | Effective activation | Pi idle | Pi running |

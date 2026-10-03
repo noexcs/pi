@@ -89,7 +89,13 @@ export function parseAceConfig(value: unknown, source: string): AceConfigFile {
 	}
 
 	const parsedInputs = inputs.map(validateInputConfig);
-	for (const input of parsedInputs) validateTransportSettings(input);
+	const inputNames = new Set<string>();
+	for (const input of parsedInputs) {
+		if (inputNames.has(input.name))
+			throw new AceConfigError(`${source}: input name "${input.name}" is configured twice`);
+		inputNames.add(input.name);
+		validateTransportSettings(input);
+	}
 
 	const parsedOutputs = parseOutputs(value.outputs, source);
 	if (parsedOutputs && sender === undefined) {
